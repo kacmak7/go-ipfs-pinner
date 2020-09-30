@@ -13,4 +13,5 @@ require (
 	github.com/ipfs/go-ipld-format v0.0.2
 	github.com/ipfs/go-log v0.0.1
 	github.com/ipfs/go-merkledag v0.3.0
+	github.com/polydawn/refmt v0.0.0-20190221155625-df39d6c2d992
 )
