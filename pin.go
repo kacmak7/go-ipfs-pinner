@@ -5,8 +5,6 @@ package pin
 import (
 	"context"
 	"fmt"
-	ds "github.com/ipfs/go-datastore"
-	"github.com/ipfs/go-ipfs-pinner/dspinner"
 
 	cid "github.com/ipfs/go-cid"
 	ipld "github.com/ipfs/go-ipld-format"
@@ -159,13 +157,4 @@ func (p Pinned) String() string {
 		modeStr, _ := ModeToString(p.Mode)
 		return fmt.Sprintf("pinned: %s", modeStr)
 	}
-}
-
-func NewPinner(dstore ds.Datastore, serv, internal ipld.DAGService) Pinner {
-	return dspinner.NewPinner(dstore, serv)
-}
-
-// LoadPinner loads a pinner and its keysets from the given datastore
-func LoadPinner(d ds.Datastore, dserv, internal ipld.DAGService) (Pinner, error) {
-	return dspinner.LoadPinner(d, dserv)
 }

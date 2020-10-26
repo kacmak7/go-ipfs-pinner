@@ -1,5 +1,6 @@
-// Package pin implements structures and methods to keep track of
-// which objects a user wants to keep stored locally.
+// Package ipldpinner implements structures and methods to keep track of
+// which objects a user wants to keep stored locally.  This implementation
+// uses an IPLD DAG to determine indirect pins.
 package ipldpinner
 
 import (
@@ -19,6 +20,8 @@ import (
 	ipfspinner "github.com/ipfs/go-ipfs-pinner"
 )
 
+const loadTimeout = 5 * time.Second
+
 var log = logging.Logger("pin")
 
 var pinDatastoreKey = ds.NewKey("/local/pins")
@@ -26,6 +29,7 @@ var pinDatastoreKey = ds.NewKey("/local/pins")
 var emptyKey cid.Cid
 
 var linkDirect, linkRecursive, linkInternal string
+
 func init() {
 	e, err := cid.Decode("QmdfTbBqBPQ7VNxZEYEj14VmRuZBkqFbiwReogJgS1zR1n")
 	if err != nil {
@@ -67,26 +71,22 @@ type pinner struct {
 	dstore      ds.Datastore
 }
 
-var _  ipfspinner.Pinner = (*pinner)(nil)
+var _ ipfspinner.Pinner = (*pinner)(nil)
 
 type syncDAGService interface {
 	ipld.DAGService
 	Sync() error
 }
 
-// NewPinner creates a new pinner using the given datastore as a backend
+// New creates a new pinner using the given datastore as a backend
 func New(dstore ds.Datastore, serv, internal ipld.DAGService) *pinner {
-
-	rcset := cid.NewSet()
-	dirset := cid.NewSet()
-
 	return &pinner{
-		recursePin:  rcset,
-		directPin:   dirset,
-		dserv:       serv,
-		dstore:      dstore,
-		internal:    internal,
+		recursePin:  cid.NewSet(),
+		directPin:   cid.NewSet(),
 		internalPin: cid.NewSet(),
+		dserv:       serv,
+		internal:    internal,
+		dstore:      dstore,
 	}
 }
 
@@ -313,11 +313,12 @@ func cidSetWithValues(cids []cid.Cid) *cid.Set {
 }
 
 // LoadPinner loads a pinner and its keysets from the given datastore
-func LoadPinner(d ds.Datastore, dserv, internal ipld.DAGService) (*pinner, error) {
-	p := new(pinner)
-
-	rootKey, err := d.Get(pinDatastoreKey)
+func LoadPinner(dstore ds.Datastore, dserv, internal ipld.DAGService) (*pinner, error) {
+	rootKey, err := dstore.Get(pinDatastoreKey)
 	if err != nil {
+		if err == ds.ErrNotFound {
+			return nil, err
+		}
 		return nil, fmt.Errorf("cannot load pin state: %v", err)
 	}
 	rootCid, err := cid.Cast(rootKey)
@@ -325,7 +326,7 @@ func LoadPinner(d ds.Datastore, dserv, internal ipld.DAGService) (*pinner, error
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(context.TODO(), time.Second*5)
+	ctx, cancel := context.WithTimeout(context.TODO(), loadTimeout)
 	defer cancel()
 
 	root, err := internal.Get(ctx, rootCid)
@@ -342,30 +343,28 @@ func LoadPinner(d ds.Datastore, dserv, internal ipld.DAGService) (*pinner, error
 	internalset.Add(rootCid)
 	recordInternal := internalset.Add
 
-	{ // load recursive set
-		recurseKeys, err := loadSet(ctx, internal, rootpb, linkRecursive, recordInternal)
-		if err != nil {
-			return nil, fmt.Errorf("cannot load recursive pins: %v", err)
-		}
-		p.recursePin = cidSetWithValues(recurseKeys)
+	// load recursive set
+	recurseKeys, err := loadSet(ctx, internal, rootpb, linkRecursive, recordInternal)
+	if err != nil {
+		return nil, fmt.Errorf("cannot load recursive pins: %v", err)
 	}
 
-	{ // load direct set
-		directKeys, err := loadSet(ctx, internal, rootpb, linkDirect, recordInternal)
-		if err != nil {
-			return nil, fmt.Errorf("cannot load direct pins: %v", err)
-		}
-		p.directPin = cidSetWithValues(directKeys)
+	// load direct set
+	directKeys, err := loadSet(ctx, internal, rootpb, linkDirect, recordInternal)
+	if err != nil {
+		return nil, fmt.Errorf("cannot load direct pins: %v", err)
 	}
 
-	p.internalPin = internalset
-
-	// assign services
-	p.dserv = dserv
-	p.dstore = d
-	p.internal = internal
-
-	return p, nil
+	return &pinner{
+		// assign pinsets
+		recursePin:  cidSetWithValues(recurseKeys),
+		directPin:   cidSetWithValues(directKeys),
+		internalPin: internalset,
+		// assign services
+		dserv:    dserv,
+		dstore:   dstore,
+		internal: internal,
+	}, nil
 }
 
 // DirectKeys returns a slice containing the directly pinned keys
@@ -490,9 +489,7 @@ func (p *pinner) Flush(ctx context.Context) error {
 func (p *pinner) InternalPins(ctx context.Context) ([]cid.Cid, error) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
-	var out []cid.Cid
-	out = append(out, p.internalPin.Keys()...)
-	return out, nil
+	return p.internalPin.Keys(), nil
 }
 
 // PinWithMode allows the user to have fine grained control over pin
