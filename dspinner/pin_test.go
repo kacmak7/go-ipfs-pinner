@@ -447,82 +447,167 @@ func makeTree(ctx context.Context, aBranchLen int, dserv ipld.DAGService, p ipfs
 	return
 }
 
-func BenchmarkPinDSPinner(b *testing.B) {
+func makeNodes(count int, dserv ipld.DAGService) []ipld.Node {
 	ctx := context.Background()
-	dstore := dssync.MutexWrap(ds.NewMapDatastore())
-	bstore := blockstore.NewBlockstore(dstore)
-	bserv := bs.New(bstore, offline.Exchange(bstore))
-
-	dserv := mdag.NewDAGService(bserv)
-	p := New(dstore, dserv)
-
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		_, err := pinMany(ctx, i, dserv, p)
-		if err != nil {
-			panic(err.Error())
-		}
-	}
-}
-
-func BenchmarkPinIPLDPinner(b *testing.B) {
-	ctx := context.Background()
-	dstore := dssync.MutexWrap(ds.NewMapDatastore())
-	bstore := blockstore.NewBlockstore(dstore)
-	bserv := bs.New(bstore, offline.Exchange(bstore))
-
-	dserv := mdag.NewDAGService(bserv)
-	p := ipldpinner.New(dstore, dserv, dserv)
-
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		_, err := pinMany(ctx, i, dserv, p)
-		if err != nil {
-			panic(err.Error())
-		}
-	}
-}
-
-func BenchmarkIsPinnedDSPinner(b *testing.B) {
-	ctx := context.Background()
-	dstore := dssync.MutexWrap(ds.NewMapDatastore())
-	bstore := blockstore.NewBlockstore(dstore)
-	bserv := bs.New(bstore, offline.Exchange(bstore))
-
-	dserv := mdag.NewDAGService(bserv)
-	p := New(dstore, dserv)
-
-	keys, err := pinMany(ctx, b.N, dserv, p)
-	if err != nil {
-		panic(err.Error())
-	}
-
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		_, _, err := p.IsPinned(ctx, keys[i])
-		if err != nil {
-			panic(err.Error())
-		}
-
-	}
-}
-
-func pinMany(ctx context.Context, count int, dserv ipld.DAGService, p ipfspin.Pinner) ([]cid.Cid, error) {
-	keys := make([]cid.Cid, count)
+	nodes := make([]ipld.Node, count)
 	for i := 0; i < count; i++ {
-		a, _ := randNode()
-		err := dserv.Add(ctx, a)
+		n, _ := randNode()
+		err := dserv.Add(ctx, n)
 		if err != nil {
-			return nil, err
+			panic(err)
 		}
-		if err = p.Pin(ctx, a, true); err != nil {
-			return nil, err
-		}
-		keys[i] = a.Cid()
+		nodes[i] = n
 	}
-	p.Flush(context.Background())
-	return keys, nil
+	return nodes
+}
+
+func pinNodes(nodes []ipld.Node, p ipfspin.Pinner) {
+	ctx := context.Background()
+	var err error
+
+	for i := range nodes {
+		err = p.Pin(ctx, nodes[i], true)
+		if err != nil {
+			panic(err)
+		}
+	}
+	err = p.Flush(ctx)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func unpinNodes(nodes []ipld.Node, p ipfspin.Pinner) {
+	ctx := context.Background()
+	var err error
+
+	for i := range nodes {
+		err = p.Unpin(ctx, nodes[i].Cid(), true)
+		if err != nil {
+			panic(err)
+		}
+	}
+	err = p.Flush(ctx)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func makeStore() (ds.Datastore, ipld.DAGService) {
+	dstore := dssync.MutexWrap(ds.NewMapDatastore())
+	bstore := blockstore.NewBlockstore(dstore)
+	bserv := bs.New(bstore, offline.Exchange(bstore))
+	dserv := mdag.NewDAGService(bserv)
+	return dstore, dserv
+}
+
+func BenchmarkPinDS(b *testing.B) {
+	dstore, dserv := makeStore()
+	pinner := New(dstore, dserv)
+	benchmarkPin(b, pinner, dserv)
+}
+
+func BenchmarkPinIPLD(b *testing.B) {
+	dstore, dserv := makeStore()
+	pinner := ipldpinner.New(dstore, dserv, dserv)
+	benchmarkPin(b, pinner, dserv)
+}
+
+func benchmarkPin(b *testing.B, pinner ipfspin.Pinner, dserv ipld.DAGService) {
+	ctx := context.Background()
+	nodes := makeNodes(b.N, dserv)
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		err := pinner.Pin(ctx, nodes[i], true)
+		if err != nil {
+			panic(err)
+		}
+		err = pinner.Flush(ctx)
+		if err != nil {
+			panic(err)
+		}
+	}
+}
+
+func BenchmarkUnpinDS(b *testing.B) {
+	dstore, dserv := makeStore()
+	pinner := New(dstore, dserv)
+	benchmarkUnpin(b, pinner, dserv)
+}
+
+func BenchmarkUnpinIPLD(b *testing.B) {
+	dstore, dserv := makeStore()
+	pinner := ipldpinner.New(dstore, dserv, dserv)
+	benchmarkUnpin(b, pinner, dserv)
+}
+
+func benchmarkUnpin(b *testing.B, pinner ipfspin.Pinner, dserv ipld.DAGService) {
+	ctx := context.Background()
+	nodes := makeNodes(b.N, dserv)
+	pinNodes(nodes, pinner)
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		err := pinner.Unpin(ctx, nodes[i].Cid(), true)
+		if err != nil {
+			panic(err)
+		}
+		err = pinner.Flush(ctx)
+		if err != nil {
+			panic(err)
+		}
+	}
+}
+
+func BenchmarkPinAllDS(b *testing.B) {
+	dstore, dserv := makeStore()
+	pinner := New(dstore, dserv)
+	benchmarkPinAll(b, pinner, dserv)
+}
+
+func BenchmarkPinAllIPLD(b *testing.B) {
+	dstore, dserv := makeStore()
+	pinner := ipldpinner.New(dstore, dserv, dserv)
+	benchmarkPinAll(b, pinner, dserv)
+}
+
+func benchmarkPinAll(b *testing.B, pinner ipfspin.Pinner, dserv ipld.DAGService) {
+	nodes := makeNodes(b.N, dserv)
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		pinNodes(nodes, pinner)
+
+		b.StopTimer()
+		unpinNodes(nodes, pinner)
+		b.StartTimer()
+	}
+}
+
+func BenchmarkUnpinAllDS(b *testing.B) {
+	dstore, dserv := makeStore()
+	pinner := New(dstore, dserv)
+	benchmarkUnpinAll(b, pinner, dserv)
+}
+
+func BenchmarkUnpinAllIPLD(b *testing.B) {
+	dstore, dserv := makeStore()
+	pinner := ipldpinner.New(dstore, dserv, dserv)
+	benchmarkUnpinAll(b, pinner, dserv)
+}
+
+func benchmarkUnpinAll(b *testing.B, pinner ipfspin.Pinner, dserv ipld.DAGService) {
+	nodes := makeNodes(b.N, dserv)
+	pinNodes(nodes, pinner)
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		unpinNodes(nodes, pinner)
+
+		b.StopTimer()
+		pinNodes(nodes, pinner)
+		b.StartTimer()
+	}
 }
