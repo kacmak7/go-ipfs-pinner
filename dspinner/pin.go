@@ -68,7 +68,8 @@ type pinner struct {
 	dserv  ipld.DAGService
 	dstore ds.Datastore
 
-	cidIndex dsindex.Indexer
+	cidIndex  dsindex.Indexer
+	nameIndex dsindex.Indexer
 }
 
 var _ ipfspinner.Pinner = (*pinner)(nil)
@@ -105,6 +106,7 @@ type syncDAGService interface {
 func New(dstore ds.Datastore, serv ipld.DAGService) ipfspinner.Pinner {
 	return &pinner{
 		cidIndex:   dsindex.New(dstore, pinCidIndexPath),
+		nameIndex:  dsindex.New(dstore, pinNameIndexPath),
 		dserv:      serv,
 		dstore:     dstore,
 		directPin:  cid.NewSet(),
@@ -183,10 +185,21 @@ func (p *pinner) addPin(c cid.Cid, mode ipfspinner.Mode, name string) error {
 		return fmt.Errorf("could not add pin cid index: %v", err)
 	}
 
+	if name != "" {
+		// Store name index
+		err = p.nameIndex.Add(name, pp.id)
+		if err != nil {
+			return fmt.Errorf("could not add pin name index: %v", err)
+		}
+	}
+
 	// Store the pin
 	err = p.dstore.Put(pp.dsKey(), pinData)
 	if err != nil {
 		p.cidIndex.Delete(c.String(), pp.id)
+		if name != "" {
+			p.nameIndex.Delete(name, pp.id)
+		}
 		return err
 	}
 
@@ -201,24 +214,32 @@ func (p *pinner) addPin(c cid.Cid, mode ipfspinner.Mode, name string) error {
 	return nil
 }
 
-func (p *pinner) removePin(pin *pin) error {
+func (p *pinner) removePin(pp *pin) error {
 	// Remove pin from datastore
-	err := p.dstore.Delete(pin.dsKey())
+	err := p.dstore.Delete(pp.dsKey())
 	if err != nil {
 		return err
 	}
 	// Remove cid index from datastore
-	err = p.cidIndex.Delete(pin.cid.String(), pin.id)
+	err = p.cidIndex.Delete(pp.cid.String(), pp.id)
 	if err != nil {
 		return err
 	}
 
+	if pp.name != "" {
+		// Remove name index from datastore
+		err = p.nameIndex.Delete(pp.name, pp.id)
+		if err != nil {
+			return err
+		}
+	}
+
 	// Update cache
-	switch pin.mode {
+	switch pp.mode {
 	case ipfspinner.Recursive:
-		p.recursePin.Remove(pin.cid)
+		p.recursePin.Remove(pp.cid)
 	case ipfspinner.Direct:
-		p.directPin.Remove(pin.cid)
+		p.directPin.Remove(pp.cid)
 	}
 
 	return nil
@@ -249,6 +270,7 @@ func (p *pinner) Unpin(ctx context.Context, c cid.Cid, recursive bool) error {
 		return err
 	}
 	if !ok {
+		p.cidIndex.DeleteAll(c.String())
 		log.Error("found CID index with missing pin")
 	}
 	return nil
@@ -598,8 +620,14 @@ func (p *pinner) rebuildIndexes(ctx context.Context) error {
 	// Build temporary in-memory CID index from pins
 	dstoreMem := ds.NewMapDatastore()
 	tmpCidIndex := dsindex.New(dstoreMem, pinCidIndexPath)
+	tmpNameIndex := dsindex.New(dstoreMem, pinNameIndexPath)
+	var hasNames bool
 	for _, pp := range pins {
 		tmpCidIndex.Add(pp.cid.String(), pp.id)
+		if pp.name != "" {
+			tmpNameIndex.Add(pp.name, pp.id)
+			hasNames = true
+		}
 
 		// Build up cache
 		if pp.mode == ipfspinner.Recursive {
@@ -614,10 +642,19 @@ func (p *pinner) rebuildIndexes(ctx context.Context) error {
 	// and writing secondary index.
 	changed, err := p.cidIndex.SyncTo(tmpCidIndex)
 	if err != nil {
-		return fmt.Errorf("cannot sync indexes: %v", err)
+		return fmt.Errorf("cannot sync cid indexes: %v", err)
 	}
 	if changed {
-		log.Error("invalid indexes detected - rebuilt")
+		log.Error("invalid cid indexes detected - rebuilt")
+	}
+	if hasNames {
+		changed, err = p.nameIndex.SyncTo(tmpNameIndex)
+		if err != nil {
+			return fmt.Errorf("cannot sync name indexes: %v", err)
+		}
+		if changed {
+			log.Error("invalid name indexes detected - rebuilt")
+		}
 	}
 
 	return nil
