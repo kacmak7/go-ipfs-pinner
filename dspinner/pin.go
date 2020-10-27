@@ -37,6 +37,8 @@ var (
 
 	linkDirect, linkRecursive         string
 	pinCidIndexPath, pinNameIndexPath string
+
+	pinDatastoreKey = ds.NewKey("/local/pins")
 )
 
 func init() {
@@ -478,23 +480,99 @@ func (p *pinner) loadAllPins() ([]*pin, error) {
 	return pins, nil
 }
 
-// LoadPinner loads a pinner and its keysets from the given datastore
-func LoadPinner(dstore ds.Datastore, dserv ipld.DAGService, internal ipld.DAGService) (ipfspinner.Pinner, error) {
+// ImportFromIPLDPinner converts pins stored in mdag based storage to pins
+// stores in the datastore. Returns a dspinner loaded with the exported pins,
+// and a count of the pins imported.
+//
+// After pins are stored in datastore, the root pin key is deleted to unlink
+// the pin data in the DAGService.
+func ImportFromIPLDPinner(dstore ds.Datastore, dserv ipld.DAGService, internal ipld.DAGService) (ipfspinner.Pinner, int, error) {
 	ctx, cancel := context.WithTimeout(context.TODO(), loadTimeout)
 	defer cancel()
 
-	if internal != nil {
-		ipldPinner, err := ipldpinner.LoadPinner(dstore, dserv, internal)
-		switch err {
-		case ds.ErrNotFound:
-			// No more dag storage; load from datastore
-		case nil:
-			// Need to convert from dag storage
-			return convertIPLDToDSPinner(ctx, ipldPinner, dstore, dserv)
-		default:
-			return nil, err
+	ipldPinner, err := ipldpinner.LoadPinner(dstore, dserv, internal)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	p := New(dstore, dserv).(*pinner)
+
+	// Save pinned CIDs as new pins in datastore.
+	rCids, _ := ipldPinner.RecursiveKeys(ctx)
+	for i := range rCids {
+		err = p.addPin(rCids[i], ipfspinner.Recursive, "")
+		if err != nil {
+			return nil, 0, err
 		}
 	}
+	dCids, _ := ipldPinner.DirectKeys(ctx)
+	for i := range dCids {
+		err = p.addPin(dCids[i], ipfspinner.Direct, "")
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+
+	// Delete root mdag key from datastore to remove old pin storage.
+	if err = dstore.Delete(pinDatastoreKey); err != nil {
+		return nil, 0, fmt.Errorf("cannot delete old pin state: %v", err)
+	}
+	if err = dstore.Sync(pinDatastoreKey); err != nil {
+		return nil, 0, fmt.Errorf("cannot sync old pin state: %v", err)
+	}
+
+	return p, len(rCids) + len(dCids), nil
+}
+
+// ExportToIPLDPinner exports the pins stored in the datastore by dspinner, and
+// imports them into the given internal DAGService.  Returns an ipldpinner
+// loaded with the exported pins, and a count of the pins exported.
+//
+// After the pins are stored in the DAGService, the pins and their indexes are
+// removed.
+func ExportToIPLDPinner(dstore ds.Datastore, dserv ipld.DAGService, internal ipld.DAGService) (ipfspinner.Pinner, int, error) {
+	p := New(dstore, dserv).(*pinner)
+	pins, err := p.loadAllPins()
+	if err != nil {
+		return nil, 0, fmt.Errorf("cannot load pins: %v", err)
+	}
+
+	ipldPinner := ipldpinner.New(dstore, dserv, internal)
+
+	seen := cid.NewSet()
+	for _, pp := range pins {
+		if seen.Has(pp.cid) {
+			// multiple pins not support; can only keep one
+			continue
+		}
+		seen.Add(pp.cid)
+		ipldPinner.PinWithMode(pp.cid, pp.mode)
+	}
+
+	ctx := context.TODO()
+
+	// Save the ipldpinner pins
+	err = ipldPinner.Flush(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Remove the dspinner pins and indexes
+	for _, pp := range pins {
+		p.removePin(pp)
+	}
+	err = p.Flush(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return ipldPinner, seen.Len(), nil
+}
+
+// LoadPinner loads a pinner and its keysets from the given datastore
+func LoadPinner(dstore ds.Datastore, dserv ipld.DAGService) (ipfspinner.Pinner, error) {
+	ctx, cancel := context.WithTimeout(context.TODO(), loadTimeout)
+	defer cancel()
 
 	p := New(dstore, dserv).(*pinner)
 	err := p.rebuildIndexes(ctx)
@@ -614,10 +692,10 @@ func (p *pinner) Flush(ctx context.Context) error {
 		}
 	}
 
-	// TODO: is it necessary to keep a list of added pins to sync?
-	//if err := p.dstore.Sync(pinKey); err != nil {
-	//	return fmt.Errorf("cannot sync pin state: %v", err)
-	//}
+	// Sync pins and indexes
+	if err := p.dstore.Sync(ds.NewKey(pinKeyPath)); err != nil {
+		return fmt.Errorf("cannot sync pin state: %v", err)
+	}
 
 	return nil
 }
@@ -628,12 +706,18 @@ func (p *pinner) PinWithMode(c cid.Cid, mode ipfspinner.Mode) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
-	ids, _ := p.cidIndex.Search(c.String())
-	for i := range ids {
-		pp, _ := p.loadPin(ids[i])
-		if pp != nil && pp.mode == mode {
-			return // already a pin for this CID with this mode
+	// TODO: remove his to support multiple pins per CID
+	switch mode {
+	case ipfspinner.Recursive:
+		if p.recursePin.Has(c) {
+			return // already a recursive pin for this CID
 		}
+	case ipfspinner.Direct:
+		if p.directPin.Has(c) {
+			return // already a direct pin for this CID
+		}
+	default:
+		panic("unrecognized pin mode")
 	}
 
 	err := p.addPin(c, mode, "")
@@ -668,47 +752,12 @@ func hasChild(ctx context.Context, ng ipld.NodeGetter, root cid.Cid, child cid.C
 	return false, nil
 }
 
-// convertIPLDToDSPinner converts pins stored in mdag based storage to pins
-// stores in the datastore. After pins are stored in datastore, then root pin
-// key is deleted to unlink the pin data in the mdag store.
-func convertIPLDToDSPinner(ctx context.Context, ipldPinner ipfspinner.Pinner, dstore ds.Datastore, dserv ipld.DAGService) (*pinner, error) {
-	var err error
-	p := New(dstore, dserv).(*pinner)
-
-	// Save pinned CIDs as new pins in datastore.
-	rCids, _ := ipldPinner.RecursiveKeys(ctx)
-	for i := range rCids {
-		err = p.addPin(rCids[i], ipfspinner.Recursive, "")
-		if err != nil {
-			return nil, err
-		}
-	}
-	dCids, _ := ipldPinner.DirectKeys(ctx)
-	for i := range rCids {
-		err = p.addPin(dCids[i], ipfspinner.Direct, "")
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// Delete root mdag key from datastore to remove old pin storage.
-	pinDatastoreKey := ds.NewKey("/local/pins")
-	if err = dstore.Delete(pinDatastoreKey); err != nil {
-		return nil, fmt.Errorf("cannot delete old pin state: %v", err)
-	}
-	if err = dstore.Sync(pinDatastoreKey); err != nil {
-		return nil, fmt.Errorf("cannot sync old pin state: %v", err)
-	}
-
-	return p, nil
-}
-
 func encodePin(p *pin) ([]byte, error) {
 	var buf bytes.Buffer
 	encoder := cbor.NewMarshaller(&buf)
 	pinData := map[string]interface{}{
 		"mode": p.mode,
-		"cid":  p.cid.String(),
+		"cid":  p.cid.Bytes(),
 	}
 	// Encode optional fields
 	if p.name != "" {
@@ -739,11 +788,11 @@ func decodePin(pid string, data []byte) (*pin, error) {
 	if !ok {
 		return nil, fmt.Errorf("missing cid")
 	}
-	cidStr, ok := cidData.(string)
+	cidBytes, ok := cidData.([]byte)
 	if !ok {
 		return nil, fmt.Errorf("invalid pin cid data")
 	}
-	c, err := cid.Decode(cidStr)
+	c, err := cid.Cast(cidBytes)
 	if err != nil {
 		return nil, fmt.Errorf("cannot decode pin cid: %v", err)
 	}

@@ -2,6 +2,7 @@ package dspinner
 
 import (
 	"context"
+	"errors"
 	"io"
 	"testing"
 	"time"
@@ -15,7 +16,9 @@ import (
 	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	offline "github.com/ipfs/go-ipfs-exchange-offline"
 	ipfspin "github.com/ipfs/go-ipfs-pinner"
+	"github.com/ipfs/go-ipfs-pinner/ipldpinner"
 	util "github.com/ipfs/go-ipfs-util"
+	ipld "github.com/ipfs/go-ipld-format"
 )
 
 var rand = util.NewTimeSeededRand()
@@ -151,7 +154,7 @@ func TestPinnerBasic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	np, err := LoadPinner(dstore, dserv, dserv)
+	np, err := LoadPinner(dstore, dserv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,11 +164,33 @@ func TestPinnerBasic(t *testing.T) {
 
 	// Test recursively pinned
 	assertPinned(t, np, bk, "could not find recursively pinned node")
+
+	ipldPinner, expCount, err := ExportToIPLDPinner(dstore, dserv, dserv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expCount != 2 {
+		t.Fatal("expected 2 exported pins, got", expCount)
+	}
+
+	assertPinned(t, ipldPinner, ak, "Could not find pinned node!")
+	assertPinned(t, ipldPinner, bk, "could not find recursively pinned node")
+
+	impPinner, impCount, err := ImportFromIPLDPinner(dstore, dserv, dserv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if impCount != expCount {
+		t.Fatal("expected", expCount, "imported pins, got", impCount)
+	}
+
+	assertPinned(t, impPinner, ak, "Could not find pinned node!")
+	assertPinned(t, impPinner, bk, "could not find recursively pinned node")
 }
 
 func TestIsPinnedLookup(t *testing.T) {
-	// We are going to test that lookups work in pins which share
-	// the same branches. For that we will construct this tree:
+	// Test that lookups work in pins which share
+	// the same branches.  For that construct this tree:
 	//
 	// A5->A4->A3->A2->A1->A0
 	//         /           /
@@ -173,12 +198,9 @@ func TestIsPinnedLookup(t *testing.T) {
 	//  \                /
 	//   C---------------
 	//
-	// We will ensure that IsPinned works for all objects both when they
+	// This ensures that IsPinned works for all objects both when they
 	// are pinned and once they have been unpinned.
 	aBranchLen := 6
-	if aBranchLen < 3 {
-		t.Fatal("set aBranchLen to at least 3")
-	}
 
 	ctx := context.Background()
 	dstore := dssync.MutexWrap(ds.NewMapDatastore())
@@ -190,72 +212,8 @@ func TestIsPinnedLookup(t *testing.T) {
 	// TODO does pinner need to share datastore with blockservice?
 	p := New(dstore, dserv)
 
-	aNodes := make([]*mdag.ProtoNode, aBranchLen)
-	aKeys := make([]cid.Cid, aBranchLen)
-	for i := 0; i < aBranchLen; i++ {
-		a, _ := randNode()
-		if i >= 1 {
-			err := a.AddNodeLink("child", aNodes[i-1])
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
-
-		err := dserv.Add(ctx, a)
-		if err != nil {
-			t.Fatal(err)
-		}
-		//t.Logf("a[%d] is %s", i, ak)
-		aNodes[i] = a
-		aKeys[i] = a.Cid()
-	}
-
-	// Pin A5 recursively
-	if err := p.Pin(ctx, aNodes[aBranchLen-1], true); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create node B and add A3 as child
-	b, _ := randNode()
-	if err := b.AddNodeLink("mychild", aNodes[3]); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create C node
-	c, _ := randNode()
-	// Add A0 as child of C
-	if err := c.AddNodeLink("child", aNodes[0]); err != nil {
-		t.Fatal(err)
-	}
-
-	// Add C
-	err := dserv.Add(ctx, c)
+	aKeys, bk, ck, err := makeTree(ctx, aBranchLen, dserv, p)
 	if err != nil {
-		t.Fatal(err)
-	}
-	ck := c.Cid()
-	//t.Logf("C is %s", ck)
-
-	// Add C to B and Add B
-	if err := b.AddNodeLink("myotherchild", c); err != nil {
-		t.Fatal(err)
-	}
-	err = dserv.Add(ctx, b)
-	if err != nil {
-		t.Fatal(err)
-	}
-	bk := b.Cid()
-	//t.Logf("B is %s", bk)
-
-	// Pin C recursively
-
-	if err := p.Pin(ctx, c, true); err != nil {
-		t.Fatal(err)
-	}
-
-	// Pin B recursively
-
-	if err := p.Pin(ctx, b, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -265,7 +223,7 @@ func TestIsPinnedLookup(t *testing.T) {
 	assertPinned(t, p, bk, "B should be pinned")
 
 	// Unpin A5 recursively
-	if err := p.Unpin(ctx, aKeys[5], true); err != nil {
+	if err = p.Unpin(ctx, aKeys[5], true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -273,7 +231,7 @@ func TestIsPinnedLookup(t *testing.T) {
 	assertUnpinned(t, p, aKeys[4], "A4 should be unpinned")
 
 	// Unpin B recursively
-	if err := p.Unpin(ctx, bk, true); err != nil {
+	if err = p.Unpin(ctx, bk, true); err != nil {
 		t.Fatal(err)
 	}
 	assertUnpinned(t, p, bk, "B should be unpinned")
@@ -389,28 +347,182 @@ func TestPinUpdate(t *testing.T) {
 	n1, c1 := randNode()
 	n2, c2 := randNode()
 
-	if err := dserv.Add(ctx, n1); err != nil {
+	err := dserv.Add(ctx, n1)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := dserv.Add(ctx, n2); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := p.Pin(ctx, n1, true); err != nil {
+	if err = dserv.Add(ctx, n2); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := p.Update(ctx, c1, c2, true); err != nil {
+	if err = p.Pin(ctx, n1, true); err != nil {
+		t.Fatal(err)
+	}
+
+	if err = p.Update(ctx, c1, c2, true); err != nil {
 		t.Fatal(err)
 	}
 
 	assertPinned(t, p, c2, "c2 should be pinned now")
 	assertUnpinned(t, p, c1, "c1 should no longer be pinned")
 
-	if err := p.Update(ctx, c2, c1, false); err != nil {
+	if err = p.Update(ctx, c2, c1, false); err != nil {
 		t.Fatal(err)
 	}
 
 	assertPinned(t, p, c2, "c2 should be pinned still")
 	assertPinned(t, p, c1, "c1 should be pinned now")
+}
+
+func makeTree(ctx context.Context, aBranchLen int, dserv ipld.DAGService, p ipfspin.Pinner) (aKeys []cid.Cid, bk cid.Cid, ck cid.Cid, err error) {
+	if aBranchLen < 3 {
+		err = errors.New("set aBranchLen to at least 3")
+		return
+	}
+
+	aNodes := make([]*mdag.ProtoNode, aBranchLen)
+	aKeys = make([]cid.Cid, aBranchLen)
+	for i := 0; i < aBranchLen; i++ {
+		a, _ := randNode()
+		if i >= 1 {
+			if err = a.AddNodeLink("child", aNodes[i-1]); err != nil {
+				return
+			}
+		}
+
+		if err = dserv.Add(ctx, a); err != nil {
+			return
+		}
+		aNodes[i] = a
+		aKeys[i] = a.Cid()
+	}
+
+	// Pin last A recursively
+	if err = p.Pin(ctx, aNodes[aBranchLen-1], true); err != nil {
+		return
+	}
+
+	// Create node B and add A3 as child
+	b, _ := randNode()
+	if err = b.AddNodeLink("mychild", aNodes[3]); err != nil {
+		return
+	}
+
+	// Create C node
+	c, _ := randNode()
+	// Add A0 as child of C
+	if err = c.AddNodeLink("child", aNodes[0]); err != nil {
+		return
+	}
+
+	// Add C
+	if err = dserv.Add(ctx, c); err != nil {
+		return
+	}
+	ck = c.Cid()
+
+	// Add C to B and Add B
+	if err = b.AddNodeLink("myotherchild", c); err != nil {
+		return
+	}
+	if err = dserv.Add(ctx, b); err != nil {
+		return
+	}
+	bk = b.Cid()
+
+	// Pin C recursively
+	if err = p.Pin(ctx, c, true); err != nil {
+		return
+	}
+
+	// Pin B recursively
+	if err = p.Pin(ctx, b, true); err != nil {
+		return
+	}
+
+	if err = p.Flush(ctx); err != nil {
+		return
+	}
+
+	return
+}
+
+func BenchmarkPinDSPinner(b *testing.B) {
+	ctx := context.Background()
+	dstore := dssync.MutexWrap(ds.NewMapDatastore())
+	bstore := blockstore.NewBlockstore(dstore)
+	bserv := bs.New(bstore, offline.Exchange(bstore))
+
+	dserv := mdag.NewDAGService(bserv)
+	p := New(dstore, dserv)
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_, err := pinMany(ctx, i, dserv, p)
+		if err != nil {
+			panic(err.Error())
+		}
+	}
+}
+
+func BenchmarkPinIPLDPinner(b *testing.B) {
+	ctx := context.Background()
+	dstore := dssync.MutexWrap(ds.NewMapDatastore())
+	bstore := blockstore.NewBlockstore(dstore)
+	bserv := bs.New(bstore, offline.Exchange(bstore))
+
+	dserv := mdag.NewDAGService(bserv)
+	p := ipldpinner.New(dstore, dserv, dserv)
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_, err := pinMany(ctx, i, dserv, p)
+		if err != nil {
+			panic(err.Error())
+		}
+	}
+}
+
+func BenchmarkIsPinnedDSPinner(b *testing.B) {
+	ctx := context.Background()
+	dstore := dssync.MutexWrap(ds.NewMapDatastore())
+	bstore := blockstore.NewBlockstore(dstore)
+	bserv := bs.New(bstore, offline.Exchange(bstore))
+
+	dserv := mdag.NewDAGService(bserv)
+	p := New(dstore, dserv)
+
+	keys, err := pinMany(ctx, b.N, dserv, p)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_, _, err := p.IsPinned(ctx, keys[i])
+		if err != nil {
+			panic(err.Error())
+		}
+
+	}
+}
+
+func pinMany(ctx context.Context, count int, dserv ipld.DAGService, p ipfspin.Pinner) ([]cid.Cid, error) {
+	keys := make([]cid.Cid, count)
+	for i := 0; i < count; i++ {
+		a, _ := randNode()
+		err := dserv.Add(ctx, a)
+		if err != nil {
+			return nil, err
+		}
+		if err = p.Pin(ctx, a, true); err != nil {
+			return nil, err
+		}
+		keys[i] = a.Cid()
+	}
+	p.Flush(context.Background())
+	return keys, nil
 }

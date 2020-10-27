@@ -34,10 +34,10 @@ func TestAdd(t *testing.T) {
 	}
 }
 
-func TestHas(t *testing.T) {
+func TestHasKey(t *testing.T) {
 	nameIndex := createIndexer()
 
-	ok, err := nameIndex.Has("bob", "b1")
+	ok, err := nameIndex.HasKey("bob", "b1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,12 +45,95 @@ func TestHas(t *testing.T) {
 		t.Fatal("missing index")
 	}
 
-	ok, err = nameIndex.Has("bob", "b3")
+	ok, err = nameIndex.HasKey("bob", "b3")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if ok {
 		t.Fatal("should not have index")
+	}
+}
+
+func TestHasAny(t *testing.T) {
+	nameIndex := createIndexer()
+
+	ok, err := nameIndex.HasAny("nothere")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("should return false")
+	}
+
+	for _, idx := range []string{"alice", "bob", ""} {
+		ok, err = nameIndex.HasAny(idx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			t.Fatal("missing indexe", idx)
+		}
+	}
+
+	count, err := nameIndex.DeleteAll("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 4 {
+		t.Fatal("expected 4 deletions")
+	}
+
+	ok, err = nameIndex.HasAny("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("should return false")
+	}
+}
+
+func TestForEach(t *testing.T) {
+	nameIndex := createIndexer()
+
+	found := make(map[string]struct{})
+	err := nameIndex.ForEach("bob", func(idx, id string) bool {
+		found[id] = struct{}{}
+		return true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, idx := range []string{"b1", "b2"} {
+		_, ok := found[idx]
+		if !ok {
+			t.Fatal("missing index for key", idx)
+		}
+	}
+
+	keys := map[string]string{}
+	err = nameIndex.ForEach("", func(idx, id string) bool {
+		keys[id] = idx
+		return true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 4 {
+		t.Fatal("expected 4 keys")
+	}
+
+	if keys["a1"] != "alice" {
+		t.Error("expected a1: alice")
+	}
+	if keys["b1"] != "bob" {
+		t.Error("expected b1: bob")
+	}
+	if keys["b2"] != "bob" {
+		t.Error("expected b2: bob")
+	}
+	if keys["c1"] != "cathy" {
+		t.Error("expected c1: cathy")
 	}
 }
 
@@ -103,7 +186,7 @@ func TestDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ok, err := nameIndex.Has("alice", "a1")
+	ok, err := nameIndex.HasKey("alice", "a1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,26 +201,9 @@ func TestDelete(t *testing.T) {
 	if count != 2 {
 		t.Fatal("wrong deleted count")
 	}
-	ok, _ = nameIndex.Has("bob", "b1")
+	ok, _ = nameIndex.HasKey("bob", "b1")
 	if ok {
 		t.Fatal("index not deleted")
-	}
-}
-
-func TestAll(t *testing.T) {
-	nameIndex := createIndexer()
-
-	all, err := nameIndex.All()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(all) != 4 {
-		t.Fatal("wrong number of indexes")
-	}
-	for k, v := range all {
-		if ok, _ := nameIndex.Has(v, k); !ok {
-			t.Fatal("indexes from all do not match what indexer has")
-		}
 	}
 }
 
@@ -158,16 +224,31 @@ func TestSyndTo(t *testing.T) {
 		t.Error("change was not indicated")
 	}
 
-	refAll, _ := refIndex.All()
-	syncAll, _ := nameIndex.All()
-
-	if len(syncAll) != len(refAll) {
-		t.Fatal("wrong number of indexes after sync")
+	// Create map of id->index in sync target
+	syncs := map[string]string{}
+	err = nameIndex.ForEach("", func(idx, id string) bool {
+		syncs[id] = idx
+		return true
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	for k, v := range refAll {
-		vSync, ok := syncAll[k]
-		if !ok || v != vSync {
-			t.Fatal("index", v, "-->", k, "was not synced")
+
+	// Iterate items in sync source and make sure they appear in target
+	var itemCount int
+	err = refIndex.ForEach("", func(idx, id string) bool {
+		itemCount++
+		syncIdx, ok := syncs[id]
+		if !ok || idx != syncIdx {
+			t.Fatal("index", idx, "-->", id, "was not synced")
 		}
+		return true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if itemCount != len(syncs) {
+		t.Fatal("different number of items in sync source and target")
 	}
 }

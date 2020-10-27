@@ -316,9 +316,6 @@ func cidSetWithValues(cids []cid.Cid) *cid.Set {
 func LoadPinner(dstore ds.Datastore, dserv, internal ipld.DAGService) (*pinner, error) {
 	rootKey, err := dstore.Get(pinDatastoreKey)
 	if err != nil {
-		if err == ds.ErrNotFound {
-			return nil, err
-		}
 		return nil, fmt.Errorf("cannot load pin state: %v", err)
 	}
 	rootCid, err := cid.Cast(rootKey)

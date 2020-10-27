@@ -14,9 +14,6 @@ type Indexer interface {
 	// Add adds the a to the an index
 	Add(index, id string) error
 
-	// Has determines if a key is in an index
-	Has(index, id string) (bool, error)
-
 	// Delete deletes the specified key from the index.  If the key is not in
 	// the datastore, this method returns no error.
 	Delete(index, id string) error
@@ -25,11 +22,20 @@ type Indexer interface {
 	// datastore, this method returns no error.
 	DeleteAll(index string) (count int, err error)
 
+	// ForEach calls the function for each key in the specified index, until
+	// there are no more keys, or until the function returns false.  If index
+	// is empty string, then all index names are iterated.
+	ForEach(index string, fn func(index, id string) bool) error
+
+	// HasKey determines the specified index contains the specified primary key
+	HasKey(index, id string) (bool, error)
+
+	// HasAny determines if any key is in the specified index.  If index is
+	// empty string, then all indexes are searched.
+	HasAny(index string) (bool, error)
+
 	// Search returns all keys for the given index
 	Search(index string) (ids []string, err error)
-
-	// All returns a map of key to secondary index value for all indexed keys
-	All() (map[string]string, error)
 
 	// Synchronize the indexes in this Indexer to match those of the given
 	// Indexer. The indexPath prefix is not synchronized, only the index/key
@@ -60,28 +66,67 @@ func (x *indexer) Add(index, id string) error {
 	return x.dstore.Put(key, []byte{})
 }
 
-func (x *indexer) Has(index, id string) (bool, error) {
-	key := ds.NewKey(path.Join(x.indexPath, index, id))
-	return x.dstore.Has(key)
-}
-
 func (x *indexer) Delete(index, id string) error {
-	key := ds.NewKey(path.Join(x.indexPath, index, id))
-	return x.dstore.Delete(key)
+	return x.dstore.Delete(ds.NewKey(path.Join(x.indexPath, index, id)))
 }
 
 func (x *indexer) DeleteAll(index string) (int, error) {
-	ids, err := x.Search(index)
+	ents, err := x.queryPrefix(path.Join(x.indexPath, index))
 	if err != nil {
 		return 0, err
 	}
-	for i := range ids {
-		err = x.Delete(index, ids[i])
+
+	for i := range ents {
+		err = x.dstore.Delete(ds.NewKey(ents[i].Key))
 		if err != nil {
 			return 0, err
 		}
 	}
-	return len(ids), nil
+
+	return len(ents), nil
+}
+
+func (x *indexer) ForEach(index string, fn func(idx, id string) bool) error {
+	q := query.Query{
+		Prefix:   path.Join(x.indexPath, index),
+		KeysOnly: true,
+	}
+	results, err := x.dstore.Query(q)
+	if err != nil {
+		return err
+	}
+
+	for {
+		r, ok := results.NextSync()
+		if !ok {
+			break
+		}
+		if r.Error != nil {
+			err = r.Error
+			break
+		}
+
+		ent := r.Entry
+		if !fn(path.Base(path.Dir(ent.Key)), path.Base(ent.Key)) {
+			break
+		}
+	}
+	results.Close()
+
+	return err
+}
+
+func (x *indexer) HasKey(index, id string) (bool, error) {
+	return x.dstore.Has(ds.NewKey(path.Join(x.indexPath, index, id)))
+}
+
+func (x *indexer) HasAny(index string) (bool, error) {
+	var any bool
+	err := x.ForEach(index, func(idx, id string) bool {
+		any = true
+		return false
+	})
+	return any, err
 }
 
 func (x *indexer) Search(index string) ([]string, error) {
@@ -100,64 +145,53 @@ func (x *indexer) Search(index string) ([]string, error) {
 	return ids, nil
 }
 
-func (x *indexer) All() (map[string]string, error) {
-	ents, err := x.queryPrefix(x.indexPath)
+func (x *indexer) SyncTo(ref Indexer) (bool, error) {
+	// Build reference index map
+	refs := map[string]string{}
+	err := ref.ForEach("", func(idx, id string) bool {
+		refs[id] = idx
+		return true
+	})
 	if err != nil {
-		return nil, err
+		return false, err
 	}
-	if len(ents) == 0 {
-		return nil, nil
-	}
-
-	indexes := make(map[string]string, len(ents))
-	for i := range ents {
-		fullPath := ents[i].Key
-		indexes[path.Base(fullPath)] = path.Base(path.Dir(fullPath))
+	if len(refs) == 0 {
+		return false, nil
 	}
 
-	return indexes, nil
-}
-
-func (x *indexer) SyncTo(ref Indexer) (changed bool, err error) {
-	var curAll, refAll map[string]string
-
-	refAll, err = ref.All()
-	if err != nil {
-		return
-	}
-
-	curAll, err = x.All()
-	if err != nil {
-		return
-	}
-
-	for k, v := range refAll {
-		cv, ok := curAll[k]
-		if ok && cv == v {
-			// same in both, so delete from both
-			delete(curAll, k)
-			delete(refAll, k)
+	// Compare current indexes
+	var delKeys []string
+	err = x.ForEach("", func(idx, id string) bool {
+		refIdx, ok := refs[id]
+		if ok && refIdx == idx {
+			// same in both; delete from refs, do not add to delKeys
+			delete(refs, id)
+		} else {
+			delKeys = append(delKeys, path.Join(x.indexPath, idx, id))
 		}
+		return true
+	})
+	if err != nil {
+		return false, err
 	}
 
-	// What remains in curAll are indexes that no longer exist
-	for k, v := range curAll {
-		err = x.dstore.Delete(ds.NewKey(path.Join(x.indexPath, v, k)))
+	// Items in delKeys are indexes that no longer exist
+	for i := range delKeys {
+		err = x.dstore.Delete(ds.NewKey(delKeys[i]))
 		if err != nil {
-			return
+			return false, err
 		}
 	}
 
-	// What remains in refAll are indexes that need to be added
-	for k, v := range refAll {
+	// What remains in refs are indexes that need to be added
+	for k, v := range refs {
 		err = x.dstore.Put(ds.NewKey(path.Join(x.indexPath, v, k)), nil)
 		if err != nil {
-			return
+			return false, err
 		}
 	}
 
-	changed = len(refAll) != 0 || len(curAll) != 0
-	return
+	return len(refs) != 0 || len(delKeys) != 0, nil
 }
 
 func (x *indexer) queryPrefix(prefix string) ([]query.Entry, error) {
