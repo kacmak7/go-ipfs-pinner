@@ -461,12 +461,12 @@ func makeNodes(count int, dserv ipld.DAGService) []ipld.Node {
 	return nodes
 }
 
-func pinNodes(nodes []ipld.Node, p ipfspin.Pinner) {
+func pinNodes(nodes []ipld.Node, p ipfspin.Pinner, recursive bool) {
 	ctx := context.Background()
 	var err error
 
 	for i := range nodes {
-		err = p.Pin(ctx, nodes[i], true)
+		err = p.Pin(ctx, nodes[i], recursive)
 		if err != nil {
 			panic(err)
 		}
@@ -499,6 +499,36 @@ func makeStore() (ds.Datastore, ipld.DAGService) {
 	bserv := bs.New(bstore, offline.Exchange(bstore))
 	dserv := mdag.NewDAGService(bserv)
 	return dstore, dserv
+}
+
+func BenchmarkLoadRebuild(b *testing.B) {
+	dstore, dserv := makeStore()
+	pinner := New(dstore, dserv)
+
+	nodes := makeNodes(1024, dserv)
+	pinNodes(nodes, pinner, true)
+
+	b.Run("RebuildTrue", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			dstore.Put(dirtyKey, []byte{1})
+
+			_, err := LoadPinner(dstore, dserv)
+			if err != nil {
+				panic(err.Error())
+			}
+		}
+	})
+
+	b.Run("RebuildFalse", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			dstore.Put(dirtyKey, []byte{0})
+
+			_, err := LoadPinner(dstore, dserv)
+			if err != nil {
+				panic(err.Error())
+			}
+		}
+	})
 }
 
 func BenchmarkPinDS(b *testing.B) {
@@ -545,7 +575,7 @@ func BenchmarkUnpinIPLD(b *testing.B) {
 func benchmarkUnpin(b *testing.B, pinner ipfspin.Pinner, dserv ipld.DAGService) {
 	ctx := context.Background()
 	nodes := makeNodes(b.N, dserv)
-	pinNodes(nodes, pinner)
+	pinNodes(nodes, pinner, true)
 
 	b.ResetTimer()
 
@@ -578,7 +608,7 @@ func benchmarkPinAll(b *testing.B, pinner ipfspin.Pinner, dserv ipld.DAGService)
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		pinNodes(nodes, pinner)
+		pinNodes(nodes, pinner, true)
 
 		b.StopTimer()
 		unpinNodes(nodes, pinner)
@@ -587,27 +617,21 @@ func benchmarkPinAll(b *testing.B, pinner ipfspin.Pinner, dserv ipld.DAGService)
 }
 
 func BenchmarkUnpinAllDS(b *testing.B) {
+	// There is no point in benchmarking this for the IPLD pinner, because it
+	// amounts to saving the root internal node with no data; so it ismostly a
+	// no-op.
 	dstore, dserv := makeStore()
 	pinner := New(dstore, dserv)
-	benchmarkUnpinAll(b, pinner, dserv)
-}
 
-func BenchmarkUnpinAllIPLD(b *testing.B) {
-	dstore, dserv := makeStore()
-	pinner := ipldpinner.New(dstore, dserv, dserv)
-	benchmarkUnpinAll(b, pinner, dserv)
-}
-
-func benchmarkUnpinAll(b *testing.B, pinner ipfspin.Pinner, dserv ipld.DAGService) {
 	nodes := makeNodes(b.N, dserv)
-	pinNodes(nodes, pinner)
+	pinNodes(nodes, pinner, true)
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
 		unpinNodes(nodes, pinner)
 
 		b.StopTimer()
-		pinNodes(nodes, pinner)
+		pinNodes(nodes, pinner, true)
 		b.StartTimer()
 	}
 }

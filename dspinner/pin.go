@@ -27,6 +27,7 @@ const (
 
 	pinKeyPath   = "/.pins/pin"
 	indexKeyPath = "/.pins/index"
+	dirtyKeyPath = "/.pins/state/dirty"
 )
 
 var (
@@ -39,6 +40,8 @@ var (
 	pinCidIndexPath, pinNameIndexPath string
 
 	pinDatastoreKey = ds.NewKey("/local/pins")
+
+	dirtyKey = ds.NewKey(dirtyKeyPath)
 )
 
 func init() {
@@ -70,6 +73,8 @@ type pinner struct {
 
 	cidIndex  dsindex.Indexer
 	nameIndex dsindex.Indexer
+
+	dirty bool
 }
 
 var _ ipfspinner.Pinner = (*pinner)(nil)
@@ -179,6 +184,8 @@ func (p *pinner) addPin(c cid.Cid, mode ipfspinner.Mode, name string) error {
 		return fmt.Errorf("could not encode pin: %v", err)
 	}
 
+	p.setDirty(true)
+
 	// Store CID index
 	err = p.cidIndex.Add(c.String(), pp.id)
 	if err != nil {
@@ -215,6 +222,8 @@ func (p *pinner) addPin(c cid.Cid, mode ipfspinner.Mode, name string) error {
 }
 
 func (p *pinner) removePin(pp *pin) error {
+	p.setDirty(true)
+
 	// Remove pin from datastore
 	err := p.dstore.Delete(pp.dsKey())
 	if err != nil {
@@ -270,6 +279,7 @@ func (p *pinner) Unpin(ctx context.Context, c cid.Cid, recursive bool) error {
 		return err
 	}
 	if !ok {
+		p.setDirty(true)
 		p.cidIndex.DeleteAll(c.String())
 		log.Error("found CID index with missing pin")
 	}
@@ -597,9 +607,33 @@ func LoadPinner(dstore ds.Datastore, dserv ipld.DAGService) (ipfspinner.Pinner, 
 	defer cancel()
 
 	p := New(dstore, dserv).(*pinner)
-	err := p.rebuildIndexes(ctx)
+
+	pins, err := p.loadAllPins()
 	if err != nil {
-		return nil, fmt.Errorf("cannot rebuild indexes: %v", err)
+		return nil, fmt.Errorf("cannot load pins: %v", err)
+	}
+	for _, pp := range pins {
+		// Build up cache
+		if pp.mode == ipfspinner.Recursive {
+			p.recursePin.Add(pp.cid)
+		} else if pp.mode == ipfspinner.Direct {
+			p.directPin.Add(pp.cid)
+		}
+	}
+
+	data, err := dstore.Get(dirtyKey)
+	if err != nil {
+		if err == ds.ErrNotFound {
+			return p, nil
+		}
+		return nil, fmt.Errorf("cannot load dirty flag: %v", err)
+	}
+	if data[0] == 1 {
+		p.dirty = true
+		err := p.rebuildIndexes(ctx, pins)
+		if err != nil {
+			return nil, fmt.Errorf("cannot rebuild indexes: %v", err)
+		}
 	}
 
 	return p, nil
@@ -608,15 +642,7 @@ func LoadPinner(dstore ds.Datastore, dserv ipld.DAGService) (ipfspinner.Pinner, 
 // rebuildIndexes uses the stored pins to rebuild secondary indexes.  This
 // resolves any discrepancy between secondary indexes and pins that could
 // result from a program termination between saving the two.
-func (p *pinner) rebuildIndexes(ctx context.Context) error {
-	pins, err := p.loadAllPins()
-	if err != nil {
-		return fmt.Errorf("cannot load pins: %v", err)
-	}
-
-	p.directPin = cid.NewSet()
-	p.recursePin = cid.NewSet()
-
+func (p *pinner) rebuildIndexes(ctx context.Context, pins []*pin) error {
 	// Build temporary in-memory CID index from pins
 	dstoreMem := ds.NewMapDatastore()
 	tmpCidIndex := dsindex.New(dstoreMem, pinCidIndexPath)
@@ -627,13 +653,6 @@ func (p *pinner) rebuildIndexes(ctx context.Context) error {
 		if pp.name != "" {
 			tmpNameIndex.Add(pp.name, pp.id)
 			hasNames = true
-		}
-
-		// Build up cache
-		if pp.mode == ipfspinner.Recursive {
-			p.recursePin.Add(pp.cid)
-		} else if pp.mode == ipfspinner.Direct {
-			p.directPin.Add(pp.cid)
 		}
 	}
 
@@ -657,7 +676,7 @@ func (p *pinner) rebuildIndexes(ctx context.Context) error {
 		}
 	}
 
-	return nil
+	return p.Flush(ctx)
 }
 
 // DirectKeys returns a slice containing the directly pinned keys
@@ -733,6 +752,8 @@ func (p *pinner) Flush(ctx context.Context) error {
 	if err := p.dstore.Sync(ds.NewKey(pinKeyPath)); err != nil {
 		return fmt.Errorf("cannot sync pin state: %v", err)
 	}
+
+	p.setDirty(false)
 
 	return nil
 }
@@ -868,4 +889,17 @@ func decodePin(pid string, data []byte) (*pin, error) {
 	}
 
 	return p, nil
+}
+
+func (p *pinner) setDirty(dirty bool) {
+	if p.dirty == dirty {
+		return
+	}
+	p.dirty = dirty
+	data := []byte{0}
+	if dirty {
+		data[0] = 1
+	}
+	p.dstore.Put(dirtyKey, data)
+	p.dstore.Sync(dirtyKey)
 }
