@@ -3,6 +3,7 @@ package dspinner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -501,6 +502,9 @@ func makeStore() (ds.Datastore, ipld.DAGService) {
 	return dstore, dserv
 }
 
+// BenchmarkLoadRebuild loads a pinner that has some number of saved pins, and
+// compares the load time when rebuilding indexes to loading without rebuilding
+// indexes.
 func BenchmarkLoadRebuild(b *testing.B) {
 	dstore, dserv := makeStore()
 	pinner := New(dstore, dserv)
@@ -531,107 +535,119 @@ func BenchmarkLoadRebuild(b *testing.B) {
 	})
 }
 
-func BenchmarkPinDS(b *testing.B) {
-	dstore, dserv := makeStore()
-	pinner := New(dstore, dserv)
-	benchmarkPin(b, pinner, dserv)
-}
+// BenchmarkPinSeries demonstrates creating individual pins. Each run in the
+// series shows performance for a larger number of individual pins.
+func BenchmarkPinSeries(b *testing.B) {
+	for count := 128; count < 16386; count <<= 1 {
+		b.Run(fmt.Sprint("PinDS-", count), func(b *testing.B) {
+			dstore, dserv := makeStore()
+			pinner := New(dstore, dserv)
+			benchmarkPin(b, count, pinner, dserv)
+		})
 
-func BenchmarkPinIPLD(b *testing.B) {
-	dstore, dserv := makeStore()
-	pinner := ipldpinner.New(dstore, dserv, dserv)
-	benchmarkPin(b, pinner, dserv)
-}
-
-func benchmarkPin(b *testing.B, pinner ipfspin.Pinner, dserv ipld.DAGService) {
-	ctx := context.Background()
-	nodes := makeNodes(b.N, dserv)
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		err := pinner.Pin(ctx, nodes[i], true)
-		if err != nil {
-			panic(err)
-		}
-		err = pinner.Flush(ctx)
-		if err != nil {
-			panic(err)
-		}
+		b.Run(fmt.Sprint("PinIPLD-", count), func(b *testing.B) {
+			dstore, dserv := makeStore()
+			pinner := ipldpinner.New(dstore, dserv, dserv)
+			benchmarkPin(b, count, pinner, dserv)
+		})
 	}
 }
 
-func BenchmarkUnpinDS(b *testing.B) {
-	dstore, dserv := makeStore()
-	pinner := New(dstore, dserv)
-	benchmarkUnpin(b, pinner, dserv)
-}
-
-func BenchmarkUnpinIPLD(b *testing.B) {
-	dstore, dserv := makeStore()
-	pinner := ipldpinner.New(dstore, dserv, dserv)
-	benchmarkUnpin(b, pinner, dserv)
-}
-
-func benchmarkUnpin(b *testing.B, pinner ipfspin.Pinner, dserv ipld.DAGService) {
+func benchmarkPin(b *testing.B, count int, pinner ipfspin.Pinner, dserv ipld.DAGService) {
 	ctx := context.Background()
-	nodes := makeNodes(b.N, dserv)
-	pinNodes(nodes, pinner, true)
-
+	nodes := makeNodes(count, dserv)
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		err := pinner.Unpin(ctx, nodes[i].Cid(), true)
-		if err != nil {
-			panic(err)
+		// Pin all the nodes one at a time.
+		for j := range nodes {
+			err := pinner.Pin(ctx, nodes[j], true)
+			if err != nil {
+				panic(err)
+			}
+			err = pinner.Flush(ctx)
+			if err != nil {
+				panic(err)
+			}
 		}
-		err = pinner.Flush(ctx)
-		if err != nil {
-			panic(err)
-		}
-	}
-}
 
-func BenchmarkPinAllDS(b *testing.B) {
-	dstore, dserv := makeStore()
-	pinner := New(dstore, dserv)
-	benchmarkPinAll(b, pinner, dserv)
-}
-
-func BenchmarkPinAllIPLD(b *testing.B) {
-	dstore, dserv := makeStore()
-	pinner := ipldpinner.New(dstore, dserv, dserv)
-	benchmarkPinAll(b, pinner, dserv)
-}
-
-func benchmarkPinAll(b *testing.B, pinner ipfspin.Pinner, dserv ipld.DAGService) {
-	nodes := makeNodes(b.N, dserv)
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		pinNodes(nodes, pinner, true)
-
+		// Unpin all nodes so that they can be pinned next iter.
 		b.StopTimer()
 		unpinNodes(nodes, pinner)
 		b.StartTimer()
 	}
 }
 
-func BenchmarkUnpinAllDS(b *testing.B) {
-	// There is no point in benchmarking this for the IPLD pinner, because it
-	// amounts to saving the root internal node with no data; so it ismostly a
-	// no-op.
-	dstore, dserv := makeStore()
-	pinner := New(dstore, dserv)
+// BenchmarkUnpinSeries demonstrates unpinning individual pins. Each run in the
+// series shows performance for a larger number of individual unpins.
+func BenchmarkUnpinSeries(b *testing.B) {
+	for count := 128; count < 16386; count <<= 1 {
+		b.Run(fmt.Sprint("UnpinDS-", count), func(b *testing.B) {
+			dstore, dserv := makeStore()
+			pinner := New(dstore, dserv)
+			benchmarkPin(b, count, pinner, dserv)
+		})
 
-	nodes := makeNodes(b.N, dserv)
+		b.Run(fmt.Sprint("UninIPLD-", count), func(b *testing.B) {
+			dstore, dserv := makeStore()
+			pinner := ipldpinner.New(dstore, dserv, dserv)
+			benchmarkPin(b, count, pinner, dserv)
+		})
+	}
+}
+
+func benchmarkUnpin(b *testing.B, count int, pinner ipfspin.Pinner, dserv ipld.DAGService) {
+	ctx := context.Background()
+	nodes := makeNodes(count, dserv)
 	pinNodes(nodes, pinner, true)
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		unpinNodes(nodes, pinner)
-
+		for j := range nodes {
+			// Unpin nodes one at a time.
+			err := pinner.Unpin(ctx, nodes[j].Cid(), true)
+			if err != nil {
+				panic(err)
+			}
+			err = pinner.Flush(ctx)
+			if err != nil {
+				panic(err)
+			}
+		}
+		// Pin all nodes so that they can be unpinned next iter.
 		b.StopTimer()
 		pinNodes(nodes, pinner, true)
+		b.StartTimer()
+	}
+}
+
+// BenchmarkPinAllSeries shows times to pin all nodes with only one Flush at
+// the end.
+func BenchmarkPinAllSeries(b *testing.B) {
+	for count := 128; count < 16386; count <<= 1 {
+		b.Run(fmt.Sprint("PinAllDS-", count), func(b *testing.B) {
+			dstore, dserv := makeStore()
+			pinner := New(dstore, dserv)
+			benchmarkPinAll(b, count, pinner, dserv)
+		})
+
+		b.Run(fmt.Sprint("PinAllIPLD-", count), func(b *testing.B) {
+			dstore, dserv := makeStore()
+			pinner := ipldpinner.New(dstore, dserv, dserv)
+			benchmarkPinAll(b, count, pinner, dserv)
+		})
+	}
+}
+
+func benchmarkPinAll(b *testing.B, count int, pinner ipfspin.Pinner, dserv ipld.DAGService) {
+	nodes := makeNodes(count, dserv)
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		pinNodes(nodes, pinner, true)
+
+		b.StopTimer()
+		unpinNodes(nodes, pinner)
 		b.StartTimer()
 	}
 }
