@@ -78,7 +78,7 @@ type pinner struct {
 	cidRIndex dsindex.Indexer
 	nameIndex dsindex.Indexer
 
-	dirty bool
+	dirty uint64
 }
 
 var _ ipfspinner.Pinner = (*pinner)(nil)
@@ -144,23 +144,27 @@ func (p *pinner) Pin(ctx context.Context, node ipld.Node, recurse bool) error {
 			return nil
 		}
 
+		dirtyBefore := p.dirty
+
 		// temporary unlock to fetch the entire graph
 		p.lock.Unlock()
 		// Fetch graph to ensure that any children of the pinned node are in
 		// the graph.
 		err = mdag.FetchGraph(ctx, c, p.dserv)
 		p.lock.Lock()
-
 		if err != nil {
 			return err
 		}
 
-		found, err = p.cidRIndex.HasAny(cidStr)
-		if err != nil {
-			return err
-		}
-		if found {
-			return nil
+		// Only look again if something has changed.
+		if p.dirty != dirtyBefore {
+			found, err = p.cidRIndex.HasAny(cidStr)
+			if err != nil {
+				return err
+			}
+			if found {
+				return nil
+			}
 		}
 
 		// TODO: remove this to support multiple pins per CID
@@ -519,9 +523,6 @@ func (p *pinner) CheckIfPinned(ctx context.Context, cids ...cid.Cid) ([]ipfspinn
 // Use with care! If used improperly, garbage collection may not
 // be successful.
 func (p *pinner) RemovePinWithMode(c cid.Cid, mode ipfspinner.Mode) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
 	// Check cache to see if CID is pinned
 	switch mode {
 	case ipfspinner.Direct, ipfspinner.Recursive:
@@ -529,6 +530,9 @@ func (p *pinner) RemovePinWithMode(c cid.Cid, mode ipfspinner.Mode) {
 		// programmer error, panic OK
 		panic("unrecognized pin type")
 	}
+
+	p.lock.Lock()
+	defer p.lock.Unlock()
 
 	p.removePinsForCid(c, mode)
 }
@@ -720,7 +724,7 @@ func LoadPinner(dstore ds.Datastore, dserv ipld.DAGService) (ipfspinner.Pinner, 
 		return nil, fmt.Errorf("cannot load dirty flag: %v", err)
 	}
 	if data[0] == 1 {
-		p.dirty = true
+		p.dirty = 1
 
 		pins, err := p.loadAllPins()
 		if err != nil {
@@ -1045,11 +1049,21 @@ func decodePin(pid string, data []byte) (*pin, error) {
 	return p, nil
 }
 
+// setDirty saves a boolean dirty flag in the datastore whenever there is a
+// transition between a dirty (counter > 0) and non-dirty (counter == 0) state.
 func (p *pinner) setDirty(dirty bool) {
-	if p.dirty == dirty {
-		return
+	if dirty {
+		p.dirty++
+		if p.dirty != 1 {
+			return // already > 1
+		}
+	} else if p.dirty == 0 {
+		return // already 0
+	} else {
+		p.dirty = 0
 	}
-	p.dirty = dirty
+
+	// Do edge-triggered write to datastore
 	data := []byte{0}
 	if dirty {
 		data[0] = 1

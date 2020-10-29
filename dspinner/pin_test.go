@@ -47,6 +47,30 @@ func assertPinned(t *testing.T, p ipfspin.Pinner, c cid.Cid, failmsg string) {
 	}
 }
 
+func assertPinnedWithType(t *testing.T, p ipfspin.Pinner, c cid.Cid, mode ipfspin.Mode, failmsg string) {
+	modeText, pinned, err := p.IsPinnedWithType(context.Background(), c, mode)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expect, ok := ipfspin.ModeToString(mode)
+	if !ok {
+		t.Fatal("unrecognized pin mode")
+	}
+
+	if !pinned {
+		t.Fatal(failmsg)
+	}
+
+	if mode == ipfspin.Any {
+		return
+	}
+
+	if expect != modeText {
+		t.Fatal("expected", expect, "pin, got", modeText)
+	}
+}
+
 func assertUnpinned(t *testing.T, p ipfspin.Pinner, c cid.Cid, failmsg string) {
 	_, pinned, err := p.IsPinned(context.Background(), c)
 	if err != nil {
@@ -82,6 +106,7 @@ func TestPinnerBasic(t *testing.T) {
 	}
 
 	assertPinned(t, p, ak, "Failed to find key")
+	assertPinnedWithType(t, p, ak, ipfspin.Direct, "Expected direct pin")
 
 	// create new node c, to be indirectly pinned through b
 	c, _ := randNode()
@@ -117,7 +142,8 @@ func TestPinnerBasic(t *testing.T) {
 
 	assertPinned(t, p, ck, "child of recursively pinned node not found")
 
-	assertPinned(t, p, bk, "Recursively pinned node not found..")
+	assertPinned(t, p, bk, "Pinned node not found")
+	assertPinnedWithType(t, p, bk, ipfspin.Recursive, "Recursively pinned node not found")
 
 	d, _ := randNode()
 	_ = d.AddNodeLink("a", a)
@@ -144,6 +170,67 @@ func TestPinnerBasic(t *testing.T) {
 
 	dk := d.Cid()
 	assertPinned(t, p, dk, "pinned node not found.")
+
+	cids, err := p.RecursiveKeys(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cids) != 2 {
+		t.Error("expected 2 recursive pins")
+	}
+	if !(bk == cids[0] || bk == cids[1]) {
+		t.Error("expected recursive pin of B")
+	}
+	if !(dk == cids[0] || dk == cids[1]) {
+		t.Error("expected recursive pin of D")
+	}
+
+	pinned, err := p.CheckIfPinned(ctx, ak, bk, ck, dk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pinned) != 4 {
+		t.Error("incorrect number of results")
+	}
+	for _, pn := range pinned {
+		switch pn.Key {
+		case ak:
+			if pn.Mode != ipfspin.Direct {
+				t.Error("A pinned with wrong mode")
+			}
+		case bk:
+			if pn.Mode != ipfspin.Recursive {
+				t.Error("B pinned with wrong mode")
+			}
+		case ck:
+			if pn.Mode != ipfspin.Indirect {
+				t.Error("C should be pinned indirectly")
+			}
+			if pn.Via != bk {
+				t.Error("C should be pinned via B")
+			}
+		case dk:
+			if pn.Mode != ipfspin.Recursive {
+				t.Error("D pinned with wrong mode")
+			}
+		}
+	}
+
+	cids, err = p.DirectKeys(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cids) != 1 {
+		t.Error("expected 1 direct pin")
+	}
+	if cids[0] != ak {
+		t.Error("wrong direct pin")
+	}
+
+	cids, _ = p.InternalPins(ctx)
+	if len(cids) != 0 {
+		t.Error("shound not have internal keys")
+	}
 
 	// Test recursive unpin
 	err = p.Unpin(ctx, dk, true)
@@ -188,6 +275,35 @@ func TestPinnerBasic(t *testing.T) {
 
 	assertPinned(t, impPinner, ak, "Could not find pinned node!")
 	assertPinned(t, impPinner, bk, "could not find recursively pinned node")
+}
+
+func TestRemovePinWithMode(t *testing.T) {
+	ctx := context.Background()
+
+	dstore := dssync.MutexWrap(ds.NewMapDatastore())
+	bstore := blockstore.NewBlockstore(dstore)
+	bserv := bs.New(bstore, offline.Exchange(bstore))
+
+	dserv := mdag.NewDAGService(bserv)
+
+	p := New(dstore, dserv)
+
+	a, ak := randNode()
+	dserv.Add(ctx, a)
+
+	p.Pin(ctx, a, false)
+
+	ok, err := p.(*pinner).removePinsForCid(ak, ipfspin.Recursive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Error("pin should not have been removed")
+	}
+
+	p.RemovePinWithMode(ak, ipfspin.Direct)
+
+	assertUnpinned(t, p, ak, "pin was not removed")
 }
 
 func TestIsPinnedLookup(t *testing.T) {
