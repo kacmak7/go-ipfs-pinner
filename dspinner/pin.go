@@ -773,7 +773,7 @@ func (p *pinner) rebuildIndexes(ctx context.Context, pins []*pin) error {
 		return fmt.Errorf("cannot sync indexes: %v", err)
 	}
 	if changed {
-		log.Error("invalid recursive indexes detected - rebuilt")
+		log.Info("invalid recursive indexes detected - rebuilt")
 	}
 
 	changed, err = p.cidDIndex.SyncTo(tmpCidDIndex)
@@ -781,7 +781,7 @@ func (p *pinner) rebuildIndexes(ctx context.Context, pins []*pin) error {
 		return fmt.Errorf("cannot sync indexes: %v", err)
 	}
 	if changed {
-		log.Error("invalid direct indexes detected - rebuilt")
+		log.Info("invalid direct indexes detected - rebuilt")
 	}
 
 	if hasNames {
@@ -790,7 +790,7 @@ func (p *pinner) rebuildIndexes(ctx context.Context, pins []*pin) error {
 			return fmt.Errorf("cannot sync name indexes: %v", err)
 		}
 		if changed {
-			log.Error("invalid name indexes detected - rebuilt")
+			log.Info("invalid name indexes detected - rebuilt")
 		}
 	}
 
