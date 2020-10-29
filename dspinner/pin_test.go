@@ -122,7 +122,6 @@ func TestPinnerBasic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	err = b.AddNodeLink("otherchild", c)
 	if err != nil {
 		t.Fatal(err)
@@ -146,11 +145,11 @@ func TestPinnerBasic(t *testing.T) {
 	assertPinnedWithType(t, p, bk, ipfspin.Recursive, "Recursively pinned node not found")
 
 	d, _ := randNode()
-	_ = d.AddNodeLink("a", a)
-	_ = d.AddNodeLink("c", c)
+	d.AddNodeLink("a", a)
+	d.AddNodeLink("c", c)
 
 	e, _ := randNode()
-	_ = d.AddNodeLink("e", e)
+	d.AddNodeLink("e", e)
 
 	// Must be in dagserv for unpin to work
 	err = dserv.Add(ctx, e)
@@ -206,8 +205,8 @@ func TestPinnerBasic(t *testing.T) {
 			if pn.Mode != ipfspin.Indirect {
 				t.Error("C should be pinned indirectly")
 			}
-			if pn.Via != bk {
-				t.Error("C should be pinned via B")
+			if pn.Via != dk && pn.Via != bk {
+				t.Error("C should be pinned via D or B")
 			}
 		case dk:
 			if pn.Mode != ipfspin.Recursive {
@@ -243,16 +242,84 @@ func TestPinnerBasic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	np, err := LoadPinner(dstore, dserv)
+	p, err = LoadPinner(dstore, dserv)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Test directly pinned
-	assertPinned(t, np, ak, "Could not find pinned node!")
+	assertPinned(t, p, ak, "Could not find pinned node!")
 
 	// Test recursively pinned
-	assertPinned(t, np, bk, "could not find recursively pinned node")
+	assertPinned(t, p, bk, "could not find recursively pinned node")
+}
+
+func TestImportExport(t *testing.T) {
+	ctx := context.Background()
+	dstore, dserv := makeStore()
+	p := New(dstore, dserv)
+
+	a, ak := randNode()
+	err := p.Pin(ctx, a, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// create new node c, to be indirectly pinned through b
+	c, ck := randNode()
+	dserv.Add(ctx, c)
+
+	// Create new node b, to be parent to a and c
+	b, _ := randNode()
+	b.AddNodeLink("child", a)
+	b.AddNodeLink("otherchild", c)
+	bk := b.Cid() // CID changed after adding links
+
+	// recursively pin B{A,C}
+	err = p.Pin(ctx, b, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = p.Flush(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	verifyPins := func(pinner ipfspin.Pinner) error {
+		pinned, err := pinner.CheckIfPinned(ctx, ak, bk, ck)
+		if err != nil {
+			return err
+		}
+		if len(pinned) != 3 {
+			return errors.New("incorrect number of results")
+		}
+		for _, pn := range pinned {
+			switch pn.Key {
+			case ak:
+				if pn.Mode != ipfspin.Direct {
+					return errors.New("A pinned with wrong mode")
+				}
+			case bk:
+				if pn.Mode != ipfspin.Recursive {
+					return errors.New("B pinned with wrong mode")
+				}
+			case ck:
+				if pn.Mode != ipfspin.Indirect {
+					return errors.New("C should be pinned indirectly")
+				}
+				if pn.Via != bk {
+					return errors.New("C should be pinned via B")
+				}
+			}
+		}
+		return nil
+	}
+
+	err = verifyPins(p)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	ipldPinner, expCount, err := ExportToIPLDPinner(dstore, dserv, dserv)
 	if err != nil {
@@ -262,10 +329,12 @@ func TestPinnerBasic(t *testing.T) {
 		t.Fatal("expected 2 exported pins, got", expCount)
 	}
 
-	assertPinned(t, ipldPinner, ak, "Could not find pinned node!")
-	assertPinned(t, ipldPinner, bk, "could not find recursively pinned node")
+	err = verifyPins(ipldPinner)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	impPinner, impCount, err := ImportFromIPLDPinner(dstore, dserv, dserv)
+	importPinner, impCount, err := ImportFromIPLDPinner(dstore, dserv, dserv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,8 +342,10 @@ func TestPinnerBasic(t *testing.T) {
 		t.Fatal("expected", expCount, "imported pins, got", impCount)
 	}
 
-	assertPinned(t, impPinner, ak, "Could not find pinned node!")
-	assertPinned(t, impPinner, bk, "could not find recursively pinned node")
+	err = verifyPins(importPinner)
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestRemovePinWithMode(t *testing.T) {
