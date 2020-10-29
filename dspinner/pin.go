@@ -23,7 +23,8 @@ import (
 )
 
 const (
-	loadTimeout = 5 * time.Second
+	loadTimeout    = 5 * time.Second
+	rebuildTimeout = 2 * time.Minute
 
 	pinKeyPath   = "/.pins/pin"
 	indexKeyPath = "/.pins/index"
@@ -36,8 +37,11 @@ var (
 
 	log = logging.Logger("pin")
 
-	linkDirect, linkRecursive         string
-	pinCidIndexPath, pinNameIndexPath string
+	linkDirect, linkRecursive string
+
+	pinCidDIndexPath string
+	pinCidRIndexPath string
+	pinNameIndexPath string
 
 	pinDatastoreKey = ds.NewKey("/local/pins")
 
@@ -57,21 +61,20 @@ func init() {
 	}
 	linkRecursive = recursiveStr
 
-	pinCidIndexPath = path.Join(indexKeyPath, "cidindex")
-	pinNameIndexPath = path.Join(indexKeyPath, "nameindex")
+	pinCidRIndexPath = path.Join(indexKeyPath, "cidRindex")
+	pinCidDIndexPath = path.Join(indexKeyPath, "cidDindex")
+	pinNameIndexPath = path.Join(indexKeyPath, "nameIndex")
 }
 
 // pinner implements the Pinner interface
 type pinner struct {
 	lock sync.RWMutex
 
-	recursePin *cid.Set
-	directPin  *cid.Set
-
 	dserv  ipld.DAGService
 	dstore ds.Datastore
 
-	cidIndex  dsindex.Indexer
+	cidDIndex dsindex.Indexer
+	cidRIndex dsindex.Indexer
 	nameIndex dsindex.Indexer
 
 	dirty bool
@@ -110,12 +113,11 @@ type syncDAGService interface {
 // New creates a new pinner using the given datastore as a backend
 func New(dstore ds.Datastore, serv ipld.DAGService) ipfspinner.Pinner {
 	return &pinner{
-		cidIndex:   dsindex.New(dstore, pinCidIndexPath),
-		nameIndex:  dsindex.New(dstore, pinNameIndexPath),
-		dserv:      serv,
-		dstore:     dstore,
-		directPin:  cid.NewSet(),
-		recursePin: cid.NewSet(),
+		cidDIndex: dsindex.New(dstore, pinCidDIndexPath),
+		cidRIndex: dsindex.New(dstore, pinCidRIndexPath),
+		nameIndex: dsindex.New(dstore, pinNameIndexPath),
+		dserv:     serv,
+		dstore:    dstore,
 	}
 }
 
@@ -127,33 +129,50 @@ func (p *pinner) Pin(ctx context.Context, node ipld.Node, recurse bool) error {
 	}
 
 	c := node.Cid()
+	cidStr := c.String()
 
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
 	if recurse {
-		if p.isPinnedWithTypeBool(ctx, c, ipfspinner.Recursive) {
+		found, err := p.cidRIndex.HasAny(cidStr)
+		if err != nil {
+			return err
+		}
+		if found {
 			return nil
 		}
 
-		p.lock.Unlock()
 		// temporary unlock to fetch the entire graph
-		err := mdag.FetchGraph(ctx, c, p.dserv)
+		p.lock.Unlock()
+		// Fetch graph to ensure that any children of the pinned node are in
+		// the graph.
+		err = mdag.FetchGraph(ctx, c, p.dserv)
 		p.lock.Lock()
+
 		if err != nil {
 			return err
 		}
 
-		if p.isPinnedWithTypeBool(ctx, c, ipfspinner.Recursive) {
+		found, err = p.cidRIndex.HasAny(cidStr)
+		if err != nil {
+			return err
+		}
+		if found {
 			return nil
 		}
 
 		// TODO: remove this to support multiple pins per CID
-		if p.isPinnedWithTypeBool(ctx, c, ipfspinner.Direct) {
+		found, err = p.cidDIndex.HasAny(cidStr)
+		if err != nil {
+			return err
+		}
+		if found {
 			ok, _ := p.removePinsForCid(c, ipfspinner.Direct)
 			if !ok {
-				// Fix cache
-				p.directPin.Remove(c)
+				// Fix index; remove index for pin that does not exist
+				p.cidDIndex.DeleteAll(c.String())
+				log.Error("found cid index for direct pin that does not exist")
 			}
 		}
 
@@ -162,8 +181,12 @@ func (p *pinner) Pin(ctx context.Context, node ipld.Node, recurse bool) error {
 			return err
 		}
 	} else {
-		if p.recursePin.Has(c) {
-			return fmt.Errorf("%s already pinned recursively", c.String())
+		found, err := p.cidRIndex.HasAny(cidStr)
+		if err != nil {
+			return err
+		}
+		if found {
+			return fmt.Errorf("%s already pinned recursively", cidStr)
 		}
 
 		err = p.addPin(c, ipfspinner.Direct, "")
@@ -187,7 +210,14 @@ func (p *pinner) addPin(c cid.Cid, mode ipfspinner.Mode, name string) error {
 	p.setDirty(true)
 
 	// Store CID index
-	err = p.cidIndex.Add(c.String(), pp.id)
+	switch mode {
+	case ipfspinner.Recursive:
+		err = p.cidRIndex.Add(c.String(), pp.id)
+	case ipfspinner.Direct:
+		err = p.cidDIndex.Add(c.String(), pp.id)
+	default:
+		panic("pin mode must be recursive or direct")
+	}
 	if err != nil {
 		return fmt.Errorf("could not add pin cid index: %v", err)
 	}
@@ -203,19 +233,15 @@ func (p *pinner) addPin(c cid.Cid, mode ipfspinner.Mode, name string) error {
 	// Store the pin
 	err = p.dstore.Put(pp.dsKey(), pinData)
 	if err != nil {
-		p.cidIndex.Delete(c.String(), pp.id)
+		if mode == ipfspinner.Recursive {
+			p.cidRIndex.Delete(c.String(), pp.id)
+		} else {
+			p.cidDIndex.Delete(c.String(), pp.id)
+		}
 		if name != "" {
 			p.nameIndex.Delete(name, pp.id)
 		}
 		return err
-	}
-
-	// Update cache
-	switch mode {
-	case ipfspinner.Recursive:
-		p.recursePin.Add(c)
-	case ipfspinner.Direct:
-		p.directPin.Add(c)
 	}
 
 	return nil
@@ -230,7 +256,11 @@ func (p *pinner) removePin(pp *pin) error {
 		return err
 	}
 	// Remove cid index from datastore
-	err = p.cidIndex.Delete(pp.cid.String(), pp.id)
+	if pp.mode == ipfspinner.Recursive {
+		err = p.cidRIndex.Delete(pp.cid.String(), pp.id)
+	} else {
+		err = p.cidDIndex.Delete(pp.cid.String(), pp.id)
+	}
 	if err != nil {
 		return err
 	}
@@ -241,14 +271,6 @@ func (p *pinner) removePin(pp *pin) error {
 		if err != nil {
 			return err
 		}
-	}
-
-	// Update cache
-	switch pp.mode {
-	case ipfspinner.Recursive:
-		p.recursePin.Remove(pp.cid)
-	case ipfspinner.Direct:
-		p.directPin.Remove(pp.cid)
 	}
 
 	return nil
@@ -266,23 +288,38 @@ func (p *pinner) Unpin(ctx context.Context, c cid.Cid, recursive bool) error {
 		}
 		matches := p.Ls(matchSpec)
 	*/
-	if p.recursePin.Has(c) {
+	cidStr := c.String()
+	has, err := p.cidRIndex.HasAny(cidStr)
+	if err != nil {
+		return err
+	}
+	var ok bool
+
+	if has {
 		if !recursive {
 			return fmt.Errorf("%s is pinned recursively", c)
 		}
-	} else if !p.directPin.Has(c) {
-		return ErrNotPinned
+	} else {
+		has, err = p.cidDIndex.HasAny(cidStr)
+		if err != nil {
+			return err
+		}
+		if !has {
+			return ErrNotPinned
+		}
 	}
 
-	ok, err := p.removePinsForCid(c, ipfspinner.Any)
+	ok, err = p.removePinsForCid(c, ipfspinner.Any)
 	if err != nil {
 		return err
 	}
 	if !ok {
 		p.setDirty(true)
-		p.cidIndex.DeleteAll(c.String())
+		p.cidRIndex.DeleteAll(cidStr)
+		p.cidDIndex.DeleteAll(cidStr)
 		log.Error("found CID index with missing pin")
 	}
+
 	return nil
 }
 
@@ -302,20 +339,24 @@ func (p *pinner) IsPinnedWithType(ctx context.Context, c cid.Cid, mode ipfspinne
 	return p.isPinnedWithType(ctx, c, mode)
 }
 
-func (p *pinner) isPinnedWithTypeBool(ctx context.Context, c cid.Cid, mode ipfspinner.Mode) bool {
-	_, found, _ := p.isPinnedWithType(ctx, c, mode)
-	return found
-}
-
 func (p *pinner) isPinnedWithType(ctx context.Context, c cid.Cid, mode ipfspinner.Mode) (string, bool, error) {
+	cidStr := c.String()
 	switch mode {
 	case ipfspinner.Recursive:
-		if p.recursePin.Has(c) {
+		has, err := p.cidRIndex.HasAny(cidStr)
+		if err != nil {
+			return "", false, err
+		}
+		if has {
 			return linkRecursive, true, nil
 		}
 		return "", false, nil
 	case ipfspinner.Direct:
-		if p.directPin.Has(c) {
+		has, err := p.cidDIndex.HasAny(cidStr)
+		if err != nil {
+			return "", false, err
+		}
+		if has {
 			return linkDirect, true, nil
 		}
 		return "", false, nil
@@ -323,10 +364,18 @@ func (p *pinner) isPinnedWithType(ctx context.Context, c cid.Cid, mode ipfspinne
 		return "", false, nil
 	case ipfspinner.Indirect:
 	case ipfspinner.Any:
-		if p.recursePin.Has(c) {
+		has, err := p.cidRIndex.HasAny(cidStr)
+		if err != nil {
+			return "", false, err
+		}
+		if has {
 			return linkRecursive, true, nil
 		}
-		if p.directPin.Has(c) {
+		has, err = p.cidDIndex.HasAny(cidStr)
+		if err != nil {
+			return "", false, err
+		}
+		if has {
 			return linkDirect, true, nil
 		}
 	default:
@@ -339,15 +388,36 @@ func (p *pinner) isPinnedWithType(ctx context.Context, c cid.Cid, mode ipfspinne
 
 	// Default is Indirect
 	visitedSet := cid.NewSet()
-	for _, rc := range p.recursePin.Keys() {
-		has, err := hasChild(ctx, p.dserv, rc, c, visitedSet.Visit)
-		if err != nil {
-			return "", false, err
+
+	// No index for given CID, so search children of all recursive pinned CIDs
+	var has bool
+	var rc cid.Cid
+	var e error
+	err := p.cidRIndex.ForEach("", func(idx, id string) bool {
+		rc, e = cid.Decode(idx)
+		if e != nil {
+			return false
+		}
+		has, e = hasChild(ctx, p.dserv, rc, c, visitedSet.Visit)
+		if e != nil {
+			return false
 		}
 		if has {
-			return rc.String(), true, nil
+			return false
 		}
+		return true
+	})
+	if err != nil {
+		return "", false, err
 	}
+	if e != nil {
+		return "", false, e
+	}
+
+	if has {
+		return rc.String(), true, nil
+	}
+
 	return "", false, nil
 }
 
@@ -363,12 +433,23 @@ func (p *pinner) CheckIfPinned(ctx context.Context, cids ...cid.Cid) ([]ipfspinn
 
 	// First check for non-Indirect pins directly
 	for _, c := range cids {
-		if p.recursePin.Has(c) {
+		cidStr := c.String()
+		has, err := p.cidRIndex.HasAny(cidStr)
+		if err != nil {
+			return nil, err
+		}
+		if has {
 			pinned = append(pinned, ipfspinner.Pinned{Key: c, Mode: ipfspinner.Recursive})
-		} else if p.directPin.Has(c) {
-			pinned = append(pinned, ipfspinner.Pinned{Key: c, Mode: ipfspinner.Direct})
 		} else {
-			toCheck.Add(c)
+			has, err = p.cidDIndex.HasAny(cidStr)
+			if err != nil {
+				return nil, err
+			}
+			if has {
+				pinned = append(pinned, ipfspinner.Pinned{Key: c, Mode: ipfspinner.Direct})
+			} else {
+				toCheck.Add(c)
+			}
 		}
 	}
 
@@ -400,14 +481,27 @@ func (p *pinner) CheckIfPinned(ctx context.Context, cids ...cid.Cid) ([]ipfspinn
 		return nil
 	}
 
-	for _, rk := range p.recursePin.Keys() {
-		err := checkChildren(rk, rk)
-		if err != nil {
-			return nil, err
+	var e error
+	err := p.cidRIndex.ForEach("", func(idx, id string) bool {
+		var rk cid.Cid
+		rk, e = cid.Decode(idx)
+		if e != nil {
+			return false
+		}
+		e = checkChildren(rk, rk)
+		if e != nil {
+			return false
 		}
 		if toCheck.Len() == 0 {
-			break
+			return false
 		}
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	if e != nil {
+		return nil, e
 	}
 
 	// Anything left in toCheck is not pinned
@@ -427,14 +521,7 @@ func (p *pinner) RemovePinWithMode(c cid.Cid, mode ipfspinner.Mode) {
 
 	// Check cache to see if CID is pinned
 	switch mode {
-	case ipfspinner.Direct:
-		if !p.directPin.Has(c) {
-			return
-		}
-	case ipfspinner.Recursive:
-		if !p.recursePin.Has(c) {
-			return
-		}
+	case ipfspinner.Direct, ipfspinner.Recursive:
 	default:
 		// programmer error, panic OK
 		panic("unrecognized pin type")
@@ -446,7 +533,24 @@ func (p *pinner) RemovePinWithMode(c cid.Cid, mode ipfspinner.Mode) {
 // removePinsForCid removes all pins for a cid that have the specified mode.
 func (p *pinner) removePinsForCid(c cid.Cid, mode ipfspinner.Mode) (bool, error) {
 	// Search for pins by CID
-	ids, err := p.cidIndex.Search(c.String())
+	var ids []string
+	var err error
+	switch mode {
+	case ipfspinner.Recursive:
+		ids, err = p.cidRIndex.Search(c.String())
+	case ipfspinner.Direct:
+		ids, err = p.cidDIndex.Search(c.String())
+	case ipfspinner.Any:
+		cidStr := c.String()
+		ids, err = p.cidRIndex.Search(cidStr)
+		dIds, dErr := p.cidDIndex.Search(cidStr)
+		if dErr != nil && err == nil {
+			err = dErr
+		}
+		if len(dIds) != 0 {
+			ids = append(ids, dIds...)
+		}
+	}
 	if err != nil {
 		return false, err
 	}
@@ -519,15 +623,15 @@ func (p *pinner) loadAllPins() ([]*pin, error) {
 // After pins are stored in datastore, the root pin key is deleted to unlink
 // the pin data in the DAGService.
 func ImportFromIPLDPinner(dstore ds.Datastore, dserv ipld.DAGService, internal ipld.DAGService) (ipfspinner.Pinner, int, error) {
-	ctx, cancel := context.WithTimeout(context.TODO(), loadTimeout)
-	defer cancel()
-
 	ipldPinner, err := ipldpinner.LoadPinner(dstore, dserv, internal)
 	if err != nil {
 		return nil, 0, err
 	}
 
 	p := New(dstore, dserv).(*pinner)
+
+	ctx, cancel := context.WithTimeout(context.TODO(), loadTimeout)
+	defer cancel()
 
 	// Save pinned CIDs as new pins in datastore.
 	rCids, _ := ipldPinner.RecursiveKeys(ctx)
@@ -603,23 +707,7 @@ func ExportToIPLDPinner(dstore ds.Datastore, dserv ipld.DAGService, internal ipl
 
 // LoadPinner loads a pinner and its keysets from the given datastore
 func LoadPinner(dstore ds.Datastore, dserv ipld.DAGService) (ipfspinner.Pinner, error) {
-	ctx, cancel := context.WithTimeout(context.TODO(), loadTimeout)
-	defer cancel()
-
 	p := New(dstore, dserv).(*pinner)
-
-	pins, err := p.loadAllPins()
-	if err != nil {
-		return nil, fmt.Errorf("cannot load pins: %v", err)
-	}
-	for _, pp := range pins {
-		// Build up cache
-		if pp.mode == ipfspinner.Recursive {
-			p.recursePin.Add(pp.cid)
-		} else if pp.mode == ipfspinner.Direct {
-			p.directPin.Add(pp.cid)
-		}
-	}
 
 	data, err := dstore.Get(dirtyKey)
 	if err != nil {
@@ -630,7 +718,16 @@ func LoadPinner(dstore ds.Datastore, dserv ipld.DAGService) (ipfspinner.Pinner, 
 	}
 	if data[0] == 1 {
 		p.dirty = true
-		err := p.rebuildIndexes(ctx, pins)
+
+		pins, err := p.loadAllPins()
+		if err != nil {
+			return nil, fmt.Errorf("cannot load pins: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(context.TODO(), rebuildTimeout)
+		defer cancel()
+
+		err = p.rebuildIndexes(ctx, pins)
 		if err != nil {
 			return nil, fmt.Errorf("cannot rebuild indexes: %v", err)
 		}
@@ -645,11 +742,16 @@ func LoadPinner(dstore ds.Datastore, dserv ipld.DAGService) (ipfspinner.Pinner, 
 func (p *pinner) rebuildIndexes(ctx context.Context, pins []*pin) error {
 	// Build temporary in-memory CID index from pins
 	dstoreMem := ds.NewMapDatastore()
-	tmpCidIndex := dsindex.New(dstoreMem, pinCidIndexPath)
+	tmpCidDIndex := dsindex.New(dstoreMem, pinCidDIndexPath)
+	tmpCidRIndex := dsindex.New(dstoreMem, pinCidRIndexPath)
 	tmpNameIndex := dsindex.New(dstoreMem, pinNameIndexPath)
 	var hasNames bool
 	for _, pp := range pins {
-		tmpCidIndex.Add(pp.cid.String(), pp.id)
+		if pp.mode == ipfspinner.Recursive {
+			tmpCidRIndex.Add(pp.cid.String(), pp.id)
+		} else if pp.mode == ipfspinner.Direct {
+			tmpCidDIndex.Add(pp.cid.String(), pp.id)
+		}
 		if pp.name != "" {
 			tmpNameIndex.Add(pp.name, pp.id)
 			hasNames = true
@@ -659,13 +761,22 @@ func (p *pinner) rebuildIndexes(ctx context.Context, pins []*pin) error {
 	// Sync the CID index to what was build from pins.  This fixes any invalid
 	// indexes, which could happen if ipfs was terminated between writing pin
 	// and writing secondary index.
-	changed, err := p.cidIndex.SyncTo(tmpCidIndex)
+	changed, err := p.cidRIndex.SyncTo(tmpCidRIndex)
 	if err != nil {
-		return fmt.Errorf("cannot sync cid indexes: %v", err)
+		return fmt.Errorf("cannot sync indexes: %v", err)
 	}
 	if changed {
-		log.Error("invalid cid indexes detected - rebuilt")
+		log.Error("invalid recursive indexes detected - rebuilt")
 	}
+
+	changed, err = p.cidDIndex.SyncTo(tmpCidDIndex)
+	if err != nil {
+		return fmt.Errorf("cannot sync indexes: %v", err)
+	}
+	if changed {
+		log.Error("invalid direct indexes detected - rebuilt")
+	}
+
 	if hasNames {
 		changed, err = p.nameIndex.SyncTo(tmpNameIndex)
 		if err != nil {
@@ -684,7 +795,25 @@ func (p *pinner) DirectKeys(ctx context.Context) ([]cid.Cid, error) {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
 
-	return p.directPin.Keys(), nil
+	var cids []cid.Cid
+	var e error
+	err := p.cidDIndex.ForEach("", func(idx, id string) bool {
+		var c cid.Cid
+		c, e = cid.Decode(idx)
+		if e != nil {
+			return false
+		}
+		cids = append(cids, c)
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	if e != nil {
+		return nil, e
+	}
+
+	return cids, nil
 }
 
 // RecursiveKeys returns a slice containing the recursively pinned keys
@@ -692,7 +821,25 @@ func (p *pinner) RecursiveKeys(ctx context.Context) ([]cid.Cid, error) {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
 
-	return p.recursePin.Keys(), nil
+	var cids []cid.Cid
+	var e error
+	err := p.cidRIndex.ForEach("", func(idx, id string) bool {
+		var c cid.Cid
+		c, e = cid.Decode(idx)
+		if e != nil {
+			return false
+		}
+		cids = append(cids, c)
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	if e != nil {
+		return nil, e
+	}
+
+	return cids, nil
 }
 
 // InternalPins returns all cids kept pinned for the internal state of the
@@ -713,11 +860,15 @@ func (p *pinner) Update(ctx context.Context, from, to cid.Cid, unpin bool) error
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
-	if !p.recursePin.Has(from) {
+	has, err := p.cidRIndex.HasAny(from.String())
+	if err != nil {
+		return err
+	}
+	if !has {
 		return fmt.Errorf("'from' cid was not recursively pinned already")
 	}
 
-	err := p.addPin(to, ipfspinner.Recursive, "")
+	err = p.addPin(to, ipfspinner.Recursive, "")
 	if err != nil {
 		return err
 	}
@@ -767,11 +918,11 @@ func (p *pinner) PinWithMode(c cid.Cid, mode ipfspinner.Mode) {
 	// TODO: remove his to support multiple pins per CID
 	switch mode {
 	case ipfspinner.Recursive:
-		if p.recursePin.Has(c) {
+		if has, _ := p.cidRIndex.HasAny(c.String()); has {
 			return // already a recursive pin for this CID
 		}
 	case ipfspinner.Direct:
-		if p.directPin.Has(c) {
+		if has, _ := p.cidDIndex.HasAny(c.String()); has {
 			return // already a direct pin for this CID
 		}
 	default:
