@@ -376,6 +376,77 @@ func TestPinUpdate(t *testing.T) {
 	assertPinned(t, p, c1, "c1 should be pinned now")
 }
 
+func TestLoadDirty(t *testing.T) {
+	ctx := context.Background()
+
+	dstore := dssync.MutexWrap(ds.NewMapDatastore())
+	bstore := blockstore.NewBlockstore(dstore)
+	bserv := bs.New(bstore, offline.Exchange(bstore))
+	dserv := mdag.NewDAGService(bserv)
+
+	p := New(dstore, dserv)
+
+	a, ak := randNode()
+	err := dserv.Add(ctx, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Pin A{} recursive
+	err = p.Pin(ctx, a, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cidStr := ak.String()
+
+	// Corrupt index
+	cidRIndex := p.(*pinner).cidRIndex
+	cidRIndex.DeleteAll(cidStr)
+
+	// Verify dirty
+	data, err := dstore.Get(dirtyKey)
+	if err != nil {
+		t.Fatalf("could not read dirty flag: %v", err)
+	}
+	if data[0] != 1 {
+		t.Fatal("dirty flag not set")
+	}
+
+	has, err := cidRIndex.HasAny(cidStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if has {
+		t.Fatal("index should be deleted")
+	}
+
+	// Create new pinner on same datastore that was never flushed.
+	p, err = LoadPinner(dstore, dserv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify not dirty
+	data, err = dstore.Get(dirtyKey)
+	if err != nil {
+		t.Fatalf("could not read dirty flag: %v", err)
+	}
+	if data[0] != 0 {
+		t.Fatal("dirty flag is set")
+	}
+
+	// Verify index rebuilt
+	cidRIndex = p.(*pinner).cidRIndex
+	has, err = cidRIndex.HasAny(cidStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !has {
+		t.Fatal("index should have been rebuilt")
+	}
+}
+
 func makeTree(ctx context.Context, aBranchLen int, dserv ipld.DAGService, p ipfspin.Pinner) (aKeys []cid.Cid, bk cid.Cid, ck cid.Cid, err error) {
 	if aBranchLen < 3 {
 		err = errors.New("set aBranchLen to at least 3")

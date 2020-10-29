@@ -1,6 +1,6 @@
 // Package ipldpinner implements structures and methods to keep track of
 // which objects a user wants to keep stored locally.  This implementation
-// uses an IPLD DAG to determine indirect pins.
+// stores pin information in a mdag structure.
 package ipldpinner
 
 import (

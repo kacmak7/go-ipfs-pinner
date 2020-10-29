@@ -1,5 +1,6 @@
-// Package pin implements structures and methods to keep track of
-// which objects a user wants to keep stored locally.
+// Package dspinner implements structures and methods to keep track of
+// which objects a user wants to keep stored locally.  This implementation
+// stores pin data in a datastore.
 package dspinner
 
 import (
@@ -278,6 +279,8 @@ func (p *pinner) removePin(pp *pin) error {
 
 // Unpin a given key
 func (p *pinner) Unpin(ctx context.Context, c cid.Cid, recursive bool) error {
+	cidStr := c.String()
+
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
@@ -288,7 +291,6 @@ func (p *pinner) Unpin(ctx context.Context, c cid.Cid, recursive bool) error {
 		}
 		matches := p.Ls(matchSpec)
 	*/
-	cidStr := c.String()
 	has, err := p.cidRIndex.HasAny(cidStr)
 	if err != nil {
 		return err
@@ -421,15 +423,16 @@ func (p *pinner) isPinnedWithType(ctx context.Context, c cid.Cid, mode ipfspinne
 	return "", false, nil
 }
 
-// CheckIfPinned Checks if a set of keys are pinned, more efficient than
+// CheckIfPinned checks if a set of keys are pinned, more efficient than
 // calling IsPinned for each key, returns the pinned status of cid(s)
 //
 // TODO: If a CID is pinned by multiple pins, should they all be reported?
 func (p *pinner) CheckIfPinned(ctx context.Context, cids ...cid.Cid) ([]ipfspinner.Pinned, error) {
-	p.lock.RLock()
-	defer p.lock.RUnlock()
 	pinned := make([]ipfspinner.Pinned, 0, len(cids))
 	toCheck := cid.NewSet()
+
+	p.lock.RLock()
+	defer p.lock.RUnlock()
 
 	// First check for non-Indirect pins directly
 	for _, c := range cids {
@@ -469,7 +472,7 @@ func (p *pinner) CheckIfPinned(ctx context.Context, cids ...cid.Cid) ([]ipfspinn
 				toCheck.Remove(c)
 			}
 
-			err := checkChildren(rk, c)
+			err = checkChildren(rk, c)
 			if err != nil {
 				return err
 			}
@@ -607,7 +610,7 @@ func (p *pinner) loadAllPins() ([]*pin, error) {
 	pins := make([]*pin, len(ents))
 	for i := range ents {
 		var p *pin
-		p, err := decodePin(path.Base(ents[i].Key), ents[i].Value)
+		p, err = decodePin(path.Base(ents[i].Key), ents[i].Value)
 		if err != nil {
 			return nil, err
 		}
@@ -860,11 +863,11 @@ func (p *pinner) Update(ctx context.Context, from, to cid.Cid, unpin bool) error
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
-	has, err := p.cidRIndex.HasAny(from.String())
+	found, err := p.cidRIndex.HasAny(from.String())
 	if err != nil {
 		return err
 	}
-	if !has {
+	if !found {
 		return fmt.Errorf("'from' cid was not recursively pinned already")
 	}
 
@@ -877,11 +880,11 @@ func (p *pinner) Update(ctx context.Context, from, to cid.Cid, unpin bool) error
 		return nil
 	}
 
-	ok, err := p.removePinsForCid(from, ipfspinner.Recursive)
+	found, err = p.removePinsForCid(from, ipfspinner.Recursive)
 	if err != nil {
 		return err
 	}
-	if !ok {
+	if !found {
 		log.Error("found CID index with missing pin")
 	}
 
